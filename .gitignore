@@ -13,3 +13,7 @@ wheels/
 dataset/
 eda_outputs/
 .DS_Store
+
+# Pipeline caches and submission outputs
+work/
+output/
