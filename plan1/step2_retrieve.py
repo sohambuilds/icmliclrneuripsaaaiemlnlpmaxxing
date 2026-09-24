@@ -2,9 +2,9 @@
 
 Run from the repository root:  python -m plan1.step2_retrieve
 Outputs (under work/plan1/p1-baseline-v1/):
-  normalized_train.parquet, normalized_test.parquet
+  normalized_{train,test}_v<N>.parquet   (N = NORMALIZE_VERSION)
   candidates_train.parquet   (s1_id, target_id, source, country, score, rank, sample)
-  retrieval_report.json, retrieval_timings.tsv
+  retrieval_report.json, retrieval_timings.tsv, retrieval_meta.json
 """
 import json
 import time
@@ -13,12 +13,12 @@ import polars as pl
 
 from . import config as C
 from .dataio import load_label_pairs, load_records
-from .normalize import normalize_records
+from .normalize import NORMALIZE_VERSION, normalize_records
 from .retrieve import candidate_report, retrieve
 
 
 def normalized(split: str) -> pl.DataFrame:
-    path = C.WORK_DIR / f"normalized_{split}.parquet"
+    path = C.WORK_DIR / f"normalized_{split}_v{NORMALIZE_VERSION}.parquet"
     if path.exists():
         return pl.read_parquet(path)
     t0 = time.time()
@@ -68,6 +68,8 @@ def main() -> None:
     print(f"retrieval: {cands.height:,} candidates in {time.time() - t0:.0f}s")
     cands.write_parquet(C.WORK_DIR / "candidates_train.parquet")
     timings.write_csv(C.WORK_DIR / "retrieval_timings.tsv", separator="\t")
+    with open(C.WORK_DIR / "retrieval_meta.json", "w", encoding="utf-8") as f:
+        json.dump({"normalize_version": NORMALIZE_VERSION, "candidates": cands.height}, f)
 
     # same-country sanity check (by construction, but verify)
     country_of = norm_train.select(target_id="entity_id", t_country="country")

@@ -6,18 +6,24 @@ in the raw cache. Other scripts and their combining marks are kept; only Latin a
 """
 import polars as pl
 
+NORMALIZE_VERSION = 2  # bump whenever the output of normalize_records changes (cache files carry it)
+
 LEGAL_FORMS = [
     "inc", "incorporated", "corp", "corporation", "co", "company", "llc", "llp", "lp", "pllc", "pc",
     "ltd", "limited", "pvt", "private", "sarl", "sas", "sasu", "eurl", "sci",
 ]
 FUNCTION_WORDS = ["and", "the", "of"]
 # dotted forms such as L.L.C. become "l l c" after punctuation -> spaces; join them so the list above catches them
-DOTTED_FORMS = {"l l c": "llc", "p l l c": "pllc", "l l p": "llp", "s a r l": "sarl", "e u r l": "eurl", "s a s u": "sasu"}
+DOTTED_FORMS = {
+    "l l c": "llc", "p l l c": "pllc", "l l p": "llp", "s a r l": "sarl", "e u r l": "eurl", "s a s u": "sasu",
+    "s a s": "sas", "s c i": "sci",
+}
 ADDRESS_ABBREVIATIONS = {
     "road": "rd", "street": "st", "saint": "st", "avenue": "av", "ave": "av",
     "boulevard": "blvd", "drive": "dr", "lane": "ln", "rue": "r",
 }
 NULL_PLACEHOLDERS = r"(?i)(?:\bnull\b|\bn/a\b)"
+ZERO_WIDTH_RE = r"[\x{200B}-\x{200D}\x{2060}\x{FEFF}]"  # joiners inside Indic words: delete, never space
 NONLATIN_RE = r"[^\p{Latin}\p{Common}\p{Inherited}]"  # a letter from any non-Latin script
 
 
@@ -31,7 +37,7 @@ def basic_clean(e: pl.Expr) -> pl.Expr:
     Accent folding removes only U+0300-U+036F (Latin combining diacritics); Indic vowel signs live in their
     own blocks and survive. Apostrophes are dropped rather than spaced so "Orelee's" == "Orelees".
     """
-    e = e.fill_null("").str.normalize("NFKC")
+    e = e.fill_null("").str.normalize("NFKC").str.replace_all(ZERO_WIDTH_RE, "")
     e = e.str.normalize("NFKD").str.replace_all(r"[\x{0300}-\x{036f}]", "").str.normalize("NFC")
     e = e.str.to_lowercase()
     e = e.str.replace_all("&", " and ").str.replace_all(r"['’‘`´]", "")
@@ -40,11 +46,15 @@ def basic_clean(e: pl.Expr) -> pl.Expr:
 
 
 def word_map(e: pl.Expr, mapping: dict[str, str]) -> pl.Expr:
-    """Replace whole words/phrases in one pass (longest first). Words are padded with double spaces so
-    neighbouring matches don't share a separator."""
+    """Replace whole words/phrases in one pass (longest first).
+
+    The text's spaces are doubled so neighbouring matches don't share a separator; multi-word keys are doubled
+    the same way so they still match.
+    """
     keys = sorted(mapping, key=len, reverse=True)
     padded = " " + e.str.replace_all(" ", "  ") + " "
-    return _ws(padded.str.replace_many([f" {k} " for k in keys], [f" {mapping[k]} " for k in keys]))
+    patterns = [" " + k.replace(" ", "  ") + " " for k in keys]
+    return _ws(padded.str.replace_many(patterns, [f" {mapping[k]} " for k in keys]))
 
 
 def number_tokens(raw_address: pl.Expr) -> pl.Expr:

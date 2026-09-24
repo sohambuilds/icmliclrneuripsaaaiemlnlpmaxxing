@@ -34,3 +34,21 @@ SAMPLE_SIZES = {  # sample name -> (pool it is drawn from, size)
 MAX_BAND = 6  # true-match-count bands 0,1,...,5,6+ used to stratify samples
 
 SEED = 42
+
+# ---- matcher (Plan 1 section 5): fixed, no sweeps ----
+LGB_PARAMS = {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "max_depth": 10,
+    "min_data_in_leaf": 100,
+    "lambda_l2": 5.0,
+    "seed": SEED,
+    "deterministic": True,
+    "force_col_wise": True,
+    "num_threads": 20,  # pinned (physical cores of the w7-3445) so reruns are identical
+    "verbosity": -1,
+}
+LGB_MAX_ROUNDS = 2000
+LGB_EARLY_STOPPING = 100
