@@ -26,7 +26,7 @@ def stratified_take(pool: pl.DataFrame, n: int) -> pl.DataFrame:
     """Proportional sample of n rows by (country, band); within a stratum take the smallest sample hash."""
     n = min(n, pool.height)
     strata = pool.group_by("country", "band").agg(size=pl.len()).sort("country", "band")
-    exact = strata["size"].to_numpy() * n / pool.height
+    exact = strata["size"].to_numpy().astype(np.float64) * n / pool.height  # float: uint32 * n overflows
     quota = np.floor(exact).astype(np.int64)
     # largest remainder so the quotas add up to exactly n
     for i in np.argsort(-(exact - quota), kind="stable")[: n - quota.sum()]:
