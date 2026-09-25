@@ -68,3 +68,43 @@ LGB_PARAMS = {
 }
 LGB_MAX_ROUNDS = 8000  # p1-v2 hit the old 2000 cap while still improving; early stopping decides
 LGB_EARLY_STOPPING = 100
+
+# Model backend for new trainings (second stage, ablations): "lightgbm" (CPU, the reference), "xgboost" or
+# "catboost" (both on the GPU). Choose with AMC_BACKEND=...; compare first with: python -m plan1.ablate backends
+MODEL_BACKEND = os.environ.get("AMC_BACKEND", "lightgbm")
+XGB_PARAMS = {  # shaped like the LightGBM settings: leaf-wise trees of up to 63 leaves, same rate and L2
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "tree_method": "hist",
+    "device": "cuda",
+    "learning_rate": 0.05,
+    "grow_policy": "lossguide",
+    "max_leaves": 63,
+    "max_depth": 10,
+    "min_child_weight": 1.0,
+    "lambda": 5.0,
+    "max_bin": 256,
+    "seed": SEED,
+    "nthread": 20,
+}
+CAT_PARAMS = {  # symmetric (oblivious) trees: a different model family, useful as a blend partner
+    "loss_function": "Logloss",
+    "eval_metric": "Logloss",
+    "task_type": "GPU",
+    "devices": "0",
+    "learning_rate": 0.08,
+    "depth": 8,
+    "l2_leaf_reg": 5.0,
+    "border_count": 254,
+    "random_seed": SEED,
+    "thread_count": 20,
+}
+
+# ---- second stage (plan1/stage2.py) ----
+STAGE2_FOLDS = 3  # out-of-fold first-stage scores for the Fit sample
+STAGE2_FOLD_SALT = "amc26-stage2-fold-v1"
+STAGE2_ANCHOR_P = 0.5  # candidates scoring at least this are the "likely records" others are compared with
+
+# ---- leaderboard variants (plan1/variants.py) ----
+VARIANT_MARGIN = 0.05  # drop a contested record when the runner-up is this close to the winner
+VARIANT_CAP = 10       # keep at most this many matches per S1 (training max is 11)

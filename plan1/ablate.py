@@ -4,6 +4,7 @@ Every variant uses the same smaller setup: 100k Fit businesses (a subset of the 
 at most ABLATION_MAX_ROUNDS rounds, threshold chosen on C-select, scored on the FIRST audit_panel (development
 data). The fresh audit_panel_2 is never used here. Needs steps 2 and 3 of the current run.
 
+  python -m plan1.ablate backends            LightGBM (CPU) vs XGBoost vs CatBoost (GPU) on identical inputs
   python -m plan1.ablate features            feature groups + the fallback search (reuses saved candidates)
   python -m plan1.ablate cleanup no_dictionary      one cleanup fix off (re-cleans train, re-searches 160k S1)
       (also: no_states, no_number_markers, no_fillers)
@@ -21,7 +22,7 @@ from . import config as C
 from .dataio import load_label_pairs, load_records
 from .features import BASE_FEATURES, FEATURE_GROUPS, FEATURES, matrix
 from .metric import per_s1, score, summarize
-from .model import train_lgb
+from .model import best_iteration, predict, train_model
 from .normalize import NORMALIZE_VERSION, normalize_records
 from .retrieve import TOP_K, candidate_report, retrieve
 from .splits import fit_sample_ids
@@ -65,13 +66,13 @@ def feature_sets(cands: pl.DataFrame, norm: pl.DataFrame, pairs: pl.DataFrame, i
 
 
 def evaluate(name: str, feats: dict, features: list[str], pairs: pl.DataFrame, ids: dict, countries: pl.DataFrame,
-             cand_recall: float) -> dict:
+             cand_recall: float, backend: str | None = None) -> dict:
     t0 = time.time()
-    booster, _ = train_lgb(matrix(feats["fit"], features), feats["fit"]["label"].to_numpy(),
-                           matrix(feats["tune"], features), feats["tune"]["label"].to_numpy(), features,
-                           max_rounds=C.ABLATION_MAX_ROUNDS, log_every=1000)
+    model, train_s = train_model(matrix(feats["fit"], features), feats["fit"]["label"].to_numpy(),
+                                 matrix(feats["tune"], features), feats["tune"]["label"].to_numpy(), features,
+                                 backend=backend, max_rounds=C.ABLATION_MAX_ROUNDS, log_every=1000)
     truth = {s: pairs.join(pl.DataFrame({"s1_id": ids[s]}), on="s1_id", how="semi") for s in ("c_select", "dev")}
-    pred = {s: feats[s].select("s1_id", "target_id").with_columns(p=pl.Series(booster.predict(matrix(feats[s], features))))
+    pred = {s: feats[s].select("s1_id", "target_id").with_columns(p=pl.Series(predict(model, matrix(feats[s], features))))
             for s in ("c_select", "dev")}
     best = pick(sweep(pred["c_select"], truth["c_select"], ids["c_select"], np.round(np.arange(0.05, 1.0, 0.01), 2)))
     accepted = pred["dev"].filter(pl.col("p") >= best["threshold"])
@@ -79,14 +80,15 @@ def evaluate(name: str, feats: dict, features: list[str], pairs: pl.DataFrame, i
     per = per_s1(accepted, truth["dev"], ids["dev"]).join(countries, on="s1_id")
     by_country = {c: summarize(g.drop("country"))["macro_f05"] for (c,), g in per.group_by("country")}
     row = {
-        "variant": name, "n_features": len(features), "rounds": booster.best_iteration, "threshold": best["threshold"],
+        "variant": name, "n_features": len(features), "rounds": best_iteration(model), "threshold": best["threshold"],
         "c_select_f05": best["macro_f05"], "dev_f05": dev["macro_f05"], "dev_us": by_country.get("US"),
         "dev_india": by_country.get("India"), "dev_precision": dev["link_precision"], "dev_recall": dev["link_recall"],
         "dev_singleton_fp": dev["singleton_false_positive_rate"], "dev_candidate_recall": cand_recall,
-        "seconds": time.time() - t0,
+        "train_seconds": train_s, "seconds": time.time() - t0,
     }
     print(f"==> {name}: dev F0.5 {row['dev_f05']:.4f} (US {row['dev_us']:.4f}, India {row['dev_india']:.4f}), "
-          f"precision {row['dev_precision']:.4f}, recall {row['dev_recall']:.4f}, {row['rounds']} rounds")
+          f"precision {row['dev_precision']:.4f}, recall {row['dev_recall']:.4f}, {row['rounds']} rounds, "
+          f"trained in {train_s:.0f}s")
     return row
 
 
@@ -103,7 +105,8 @@ def save(rows: list[dict]) -> None:
     pl.Config.set_tbl_rows(30)
     pl.Config.set_tbl_width_chars(250)
     print(new.select("variant", "n_features", "dev_f05", *(["dev_f05_change_vs_full"] if ref.height else []),
-                     "dev_us", "dev_india", "dev_precision", "dev_recall", "dev_candidate_recall", "rounds"))
+                     "dev_us", "dev_india", "dev_precision", "dev_recall", "dev_candidate_recall", "rounds",
+                     *(["train_seconds"] if "train_seconds" in new.columns else [])))
     print("saved:", path)
 
 
@@ -130,6 +133,16 @@ def main(mode: str, variant: str | None = None) -> None:
         rows.append(evaluate("no_fallback_search", feats, [f for f in FEATURES if f not in FEATURE_GROUPS["fallback"]],
                              pairs, ids, countries, recall))
 
+    elif mode == "backends":
+        # same features, sample and threshold procedure; only the tree library differs
+        norm = pl.read_parquet(C.WORK_DIR / f"normalized_train_v{NORMALIZE_VERSION}.parquet")
+        cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
+        recall = candidate_report(cands, pairs, ids["dev"], norm)["candidate_recall"]
+        feats = feature_sets(cands, norm, pairs, ids, "full")
+        rows.append(evaluate("full", feats, FEATURES, pairs, ids, countries, recall, backend="lightgbm"))
+        rows.append(evaluate("full_xgboost_gpu", feats, FEATURES, pairs, ids, countries, recall, backend="xgboost"))
+        rows.append(evaluate("full_catboost_gpu", feats, FEATURES, pairs, ids, countries, recall, backend="catboost"))
+
     elif mode == "cleanup":
         if variant not in CLEANUP:
             raise SystemExit(f"cleanup variant must be one of {list(CLEANUP)}")
@@ -155,7 +168,7 @@ def main(mode: str, variant: str | None = None) -> None:
         feats = feature_sets(cands, norm, pairs, ids, variant)
         rows.append(evaluate(variant, feats, FEATURES, pairs, ids, countries, recall))
     else:
-        raise SystemExit("usage: python -m plan1.ablate features | cleanup <variant>")
+        raise SystemExit("usage: python -m plan1.ablate backends | features | cleanup <variant>")
     save(rows)
 
 
