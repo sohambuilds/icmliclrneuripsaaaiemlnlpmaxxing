@@ -1,8 +1,9 @@
-"""Step 4: choose one global threshold on C-select, freeze the configuration, score the Audit panel once.
+"""Step 4: choose one global threshold on C-select, freeze the configuration, score the Audit panels.
 
 Run from the repository root:  python -m plan1.step4_threshold
-Outputs (under work/plan1/p1-baseline-v1/):
-  c_select_sweep.tsv, frozen_config.json, audit_report.json, audit_predictions.parquet
+Headline: the fresh audit_panel_2. The first audit_panel is reported as development data (seen by earlier runs).
+Outputs (under work/plan1/<run>/):
+  c_select_sweep.tsv, frozen_config.json, audit_report.json, audit_predictions.parquet (fresh panel)
 """
 import hashlib
 import json
@@ -18,6 +19,7 @@ from .features import FEATURES, matrix
 from .metric import per_s1, score, summarize
 from .normalize import NORMALIZE_VERSION
 from .retrieve import TFIDF_PARAMS, TOP_K, candidate_report
+from .splits import fresh_audit_panel
 from .step3_train import labelled_features
 
 
@@ -88,6 +90,7 @@ def main() -> None:
         "c_select_macro_f05": best["macro_f05"],
         "model_sha256": sha256(C.WORK_DIR / "model.txt"),
         "manifest_sha256": sha256(C.SPLIT_DIR / "manifest.parquet"),
+        "audit_panel_2_sha256": sha256(C.SPLIT_DIR / "audit_panel_2.tsv"),
         "normalize_version": NORMALIZE_VERSION,
         "features": FEATURES,
         "lgb_params": C.LGB_PARAMS,
@@ -105,52 +108,62 @@ def main() -> None:
     path.write_text(json.dumps(frozen, indent=2), encoding="utf-8")
     print("frozen:", path)
 
-    # ---- score the Audit panel once with the frozen configuration ----
-    au_ids = manifest.filter(pl.col("sample") == "audit_panel")["s1_id"]
-    au_truth = pairs.join(pl.DataFrame({"s1_id": au_ids}), on="s1_id", how="semi")
-    au_cands = cands.join(pl.DataFrame({"s1_id": au_ids}), on="s1_id", how="semi")
-    t0 = time.time()
-    au = predict(booster, au_cands, pairs, norm, "audit")
-    score_s = time.time() - t0
-    accepted = au.filter(pl.col("p") >= thr)
-    headline = score(accepted, au_truth, au_ids)
-
-    countries = manifest.select("s1_id", "country")
-    per = per_s1(accepted, au_truth, au_ids).join(countries, on="s1_id")
-    by_country = {c: summarize(g.drop("country")) for (c,), g in per.group_by("country")}
-    retrieval = candidate_report(au_cands, pairs, au_ids, norm)
-    collisions = accepted.group_by("target_id").agg(n=pl.col("s1_id").n_unique())
-    rule = au.filter((pl.col("name_red_ratio") == 1.0) & (pl.col("num_jaccard") > 0))  # simple name + number rule, same candidates
+    # ---- score the panels with the frozen configuration ----
+    # audit_panel_2 (fresh, never used before) is the headline; the first audit_panel was already seen by earlier
+    # runs, so it is development data and is shown only for comparison with them.
     timings = pl.read_csv(C.WORK_DIR / "retrieval_timings.tsv", separator="\t")
+    report = {"frozen_threshold": thr}
+    for key, ids, label in (("audit_fresh", fresh_audit_panel(manifest), "audit_panel_2 (fresh)"),
+                            ("audit_dev", manifest.filter(pl.col("sample") == "audit_panel")["s1_id"], "audit_panel (dev)")):
+        report[key], pred = panel_report(booster, cands, pairs, norm, manifest, ids, thr, label)
+        if key == "audit_fresh":
+            pred.select("s1_id", "target_id", "source", "label", "p").write_parquet(C.WORK_DIR / "audit_predictions.parquet")
+    report["costs_seconds"] = {
+        "retrieval_index_build_total": float(timings["index_build_s"].sum()),
+        "retrieval_query_total": float(timings["query_s"].sum()),
+        "model_training": model_meta["train_seconds"],
+    }
+    (C.WORK_DIR / "audit_report.json").write_text(json.dumps(report, indent=2, default=float), encoding="utf-8")
 
-    report = {
-        "frozen_threshold": thr,
-        "audit": headline,
-        "audit_by_country": by_country,
+    print("\n==== Audit panels (frozen) ====")
+    print(json.dumps(report, indent=2, default=float))
+    for key in ("audit_fresh", "audit_dev"):
+        a = report[key]
+        print(f"{key}: F0.5 {a['audit']['macro_f05']:.4f} | US {a['audit_by_country'].get('US', {}).get('macro_f05', float('nan')):.4f} "
+              f"| India {a['audit_by_country'].get('India', {}).get('macro_f05', float('nan')):.4f} "
+              f"| precision {a['audit']['link_precision']:.4f} recall {a['audit']['link_recall']:.4f} "
+              f"| singleton FP {a['audit']['singleton_false_positive_rate']:.4f} | candidate recall {a['candidate_recall']:.4f}")
+    if report["audit_fresh"]["audit"]["macro_f05"] <= report["audit_fresh"]["baseline_empty_all_macro_f05"]:
+        raise RuntimeError("the learned pipeline does not beat predicting empty for every S1: something is broken")
+
+
+def panel_report(booster, cands, pairs, norm, manifest, ids: pl.Series, thr: float, label: str) -> tuple[dict, pl.DataFrame]:
+    truth = pairs.join(pl.DataFrame({"s1_id": ids}), on="s1_id", how="semi")
+    pc = cands.join(pl.DataFrame({"s1_id": ids}), on="s1_id", how="semi")
+    t0 = time.time()
+    pred = predict(booster, pc, pairs, norm, label)
+    score_s = time.time() - t0
+    accepted = pred.filter(pl.col("p") >= thr)
+    per = per_s1(accepted, truth, ids).join(manifest.select("s1_id", "country"), on="s1_id")
+    retrieval = candidate_report(pc, pairs, ids, norm)
+    collisions = accepted.group_by("target_id").agg(n=pl.col("s1_id").n_unique())
+    rule = pred.filter((pl.col("name_red_ratio") == 1.0) & (pl.col("num_jaccard") > 0))  # simple name + number rule
+    return {
+        "panel": label,
+        "audit": score(accepted, truth, ids),
+        "audit_by_country": {c: summarize(g.drop("country")) for (c,), g in per.group_by("country")},
         "candidate_recall": retrieval["candidate_recall"],
         "candidate_oracle_macro_f05": retrieval["candidate_oracle"]["macro_f05"],
         "retrieval_recall_by_country": retrieval["recall_by_country"],
         "retrieval_recall_indic_names": retrieval["recall_by_name_nonlatin"],
         "retrieval_recall_missing_address": retrieval["recall_by_addr_missing"],
+        "true_links_found_only_by_fallback": retrieval["true_links_found_only_by_fallback"],
         "mean_candidates_per_s1": retrieval["mean_candidates_per_s1"],
         "targets_accepted_by_multiple_s1": int((collisions["n"] > 1).sum()),
-        "accepted_targets": collisions.height,
-        "baseline_empty_all_macro_f05": score(au.head(0), au_truth, au_ids)["macro_f05"],
-        "baseline_exact_name_plus_number_rule_macro_f05": score(rule, au_truth, au_ids)["macro_f05"],
-        "costs_seconds": {
-            "retrieval_index_build_total": float(timings["index_build_s"].sum()),
-            "retrieval_query_total_160k_queries": float(timings["query_s"].sum()),
-            "model_training": model_meta["train_seconds"],
-            "audit_features_and_scoring_20k_s1": score_s,
-        },
-    }
-    (C.WORK_DIR / "audit_report.json").write_text(json.dumps(report, indent=2, default=float), encoding="utf-8")
-    au.select("s1_id", "target_id", "source", "label", "p").write_parquet(C.WORK_DIR / "audit_predictions.parquet")
-
-    print("\n==== Audit panel (frozen, scored once) ====")
-    print(json.dumps(report, indent=2, default=float))
-    if headline["macro_f05"] <= report["baseline_empty_all_macro_f05"]:
-        raise RuntimeError("the learned pipeline does not beat predicting empty for every S1: something is broken")
+        "baseline_empty_all_macro_f05": score(pred.head(0), truth, ids)["macro_f05"],
+        "baseline_exact_name_plus_number_rule_macro_f05": score(rule, truth, ids)["macro_f05"],
+        "features_and_scoring_seconds": score_s,
+    }, pred
 
 
 if __name__ == "__main__":

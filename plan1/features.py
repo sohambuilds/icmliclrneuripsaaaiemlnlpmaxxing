@@ -8,6 +8,7 @@ Run p1-v2: the 12 Plan 1 features plus
   - features relative to the S1's other candidates (share of best retrieval score, gap to best, ...),
   - similarity to the S1's anchor: its best other candidate by retrieval score (duplicates of one business
     tend to resemble each other).
+  - p1-v3: the name-only fallback search score, and whether the candidate came only from that search.
 The relative and anchor features need all candidates of an S1 in the same call.
 """
 import numpy as np
@@ -34,8 +35,16 @@ EXTRA_FEATURES = [
     "cand_name_nonlatin", "num_shared",
     "score_rel_max", "score_gap_max", "rank_overall", "n_close", "n_name_close", "name_set_gap", "addr_set_gap",
     "anchor_name_set", "anchor_addr_set",
+    "fallback_name_score", "from_fallback",
 ]
 FEATURES = BASE_FEATURES + EXTRA_FEATURES
+FEATURE_GROUPS = {  # for ablations (plan1/ablate.py)
+    "extra_similarity": ["name_red_token_sort", "name_red_partial", "name_red_jw", "name_nospace_ratio", "addr_ratio",
+                         "cand_name_nonlatin", "num_shared"],
+    "relative": ["score_rel_max", "score_gap_max", "rank_overall", "n_close", "n_name_close", "name_set_gap", "addr_set_gap"],
+    "anchor": ["anchor_name_set", "anchor_addr_set"],
+    "fallback": ["fallback_name_score", "from_fallback"],
+}
 _TEXT_COLS = ["name_red", "name_cons", "addr_norm", "addr_nums", "addr_missing", "name_nonlatin"]
 F32 = pl.Float32
 
@@ -72,11 +81,13 @@ def _add_anchor(cands: pl.DataFrame) -> pl.DataFrame:
 
 
 def build_features(cands: pl.DataFrame, q: pl.DataFrame, t: pl.DataFrame, batch: int = 2_000_000) -> pl.DataFrame:
-    """cands: s1_id, target_id, source, score, rank (ALL candidates of each S1 present). q/t from text_lookup.
+    """cands: s1_id, target_id, source, score, rank[, fb_score] (ALL candidates of each S1 present). q/t from text_lookup.
 
     Returns s1_id, target_id, source + FEATURES (Float32), in the order of `cands`.
     """
-    cands = _add_anchor(cands.select("s1_id", "target_id", "source", "score", "rank"))
+    if "fb_score" not in cands.columns:
+        cands = cands.with_columns(fb_score=pl.lit(None, dtype=F32))
+    cands = _add_anchor(cands.select("s1_id", "target_id", "source", "score", "rank", "fb_score"))
     anchor_text = t.select(anchor_id="target_id", a_name_red="t_name_red", a_addr_norm="t_addr_norm")
     parts = []
     for start in range(0, cands.height, batch):
@@ -129,6 +140,8 @@ def build_features(cands: pl.DataFrame, q: pl.DataFrame, t: pl.DataFrame, batch:
             "num_shared": inter,
             "anchor_name_set": _sim(tn, b["a_name_red"], fuzz.token_set_ratio),
             "anchor_addr_set": _sim(ta, b["a_addr_norm"], fuzz.token_set_ratio),
+            "fallback_name_score": b["fb_score"].cast(F32),
+            "from_fallback": b["fb_score"].is_not_null().cast(F32),
         }))
     out = pl.concat(parts)
     floats = [c for c in out.columns if c not in ("s1_id", "target_id", "source")]
@@ -149,6 +162,6 @@ def build_features(cands: pl.DataFrame, q: pl.DataFrame, t: pl.DataFrame, batch:
     return out
 
 
-def matrix(feats: pl.DataFrame) -> np.ndarray:
-    """Feature matrix in the fixed FEATURES order; nulls become NaN (LightGBM's missing value)."""
-    return feats.select(FEATURES).cast(pl.Float32).fill_null(np.nan).to_numpy()
+def matrix(feats: pl.DataFrame, features: list[str] = FEATURES) -> np.ndarray:
+    """Feature matrix in the given (default: FEATURES) order; nulls become NaN (LightGBM's missing value)."""
+    return feats.select(features).cast(pl.Float32).fill_null(np.nan).to_numpy()

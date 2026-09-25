@@ -7,9 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get("AMC_DATA_DIR", ROOT / "dataset"))
-# p1-baseline-v1: the frozen Plan 1 baseline (code as of its run). p1-v2: + quick fixes (see normalize.py, features.py).
-# Set AMC_RUN_ID=p1-baseline-v1 only for scripts that just read that run's saved outputs (e.g. step5b).
-RUN_ID = os.environ.get("AMC_RUN_ID", "p1-v2")
+# p1-baseline-v1: the frozen Plan 1 baseline. p1-v2: + quick fixes. p1-v3: + name-only fallback search, longer
+# training, better dictionary, fresh Audit panel, crowded-record variant (see PLAN1_LESSONS.md).
+# Set AMC_RUN_ID to an older run only for scripts that just read that run's saved outputs (e.g. step5b).
+RUN_ID = os.environ.get("AMC_RUN_ID", "p1-v3")
 
 SHARED_DIR = ROOT / "work" / "shared"  # raw caches and the split manifest, shared by all plans
 RAW_DIR = SHARED_DIR / "raw"
@@ -36,6 +37,17 @@ SAMPLE_SIZES = {  # sample name -> (pool it is drawn from, size)
 MAX_BAND = 6  # true-match-count bands 0,1,...,5,6+ used to stratify samples
 # p1-v2 trains on a larger draw from the Fit role (same stratification and sample salt; contains the 100k sample)
 FIT_SAMPLE_SIZE = 300_000
+# p1-v3: a fresh 20k Audit panel from Audit-role S1 never used before (the first panel is now development data)
+AUDIT_PANEL_2_SALT = "amc26-audit-panel-2-v1"
+AUDIT_PANEL_2_SIZE = 20_000
+
+# ---- candidate search / decisions ----
+FALLBACK_TOP_K = 10  # name-only fallback search over records without an address, per source
+CROWD_LIMIT = 10     # variant submission: drop records accepted for this many S1 or more
+
+# ---- ablations (plan1/ablate.py): smaller, identical setup for every variant ----
+ABLATION_FIT_SIZE = 100_000
+ABLATION_MAX_ROUNDS = 3000
 
 SEED = 42
 
@@ -54,5 +66,5 @@ LGB_PARAMS = {
     "num_threads": 20,  # pinned (physical cores of the w7-3445) so reruns are identical
     "verbosity": -1,
 }
-LGB_MAX_ROUNDS = 2000
+LGB_MAX_ROUNDS = 8000  # p1-v2 hit the old 2000 cap while still improving; early stopping decides
 LGB_EARLY_STOPPING = 100

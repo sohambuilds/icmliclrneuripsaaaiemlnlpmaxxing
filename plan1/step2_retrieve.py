@@ -17,7 +17,7 @@ from . import config as C
 from .dataio import load_label_pairs, load_records
 from .normalize import NORMALIZE_VERSION, normalize_records
 from .retrieve import candidate_report, retrieve
-from .splits import fit_sample_ids
+from .splits import fit_sample_ids, fresh_audit_panel
 from .translit import build_dictionary, coverage, make_converter
 
 
@@ -34,7 +34,11 @@ def translit_map() -> dict:
     stats["coverage_test_s2s3"] = coverage(load_records("test"), mapping)
     C.WORK_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"stats": stats, "mapping": mapping}, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"Indian-script dictionary built in {time.time() - t0:.0f}s: {json.dumps(stats)}")
+    print(f"Indian-script dictionary built in {time.time() - t0:.0f}s:")
+    print(json.dumps({k: v for k, v in stats.items() if not isinstance(v, list)}))
+    for key in ("dropped_most_frequent", "kept_by_sound_only"):
+        print(f"\n{key} (word, mapped to, times, appearances, share, mean sim, mean spelling sim):")
+        print(pl.DataFrame(stats[key]) if stats[key] else "  none")
     return mapping
 
 
@@ -82,9 +86,10 @@ def main() -> None:
     samples = pl.concat([
         pl.DataFrame({"s1_id": fit_ids}).with_columns(sample=pl.lit("fit_sample")),
         manifest.filter(pl.col("sample").is_in(["tune_sample", "c_select_sample", "audit_panel"])).select("s1_id", "sample"),
+        pl.DataFrame({"s1_id": fresh_audit_panel(manifest)}).with_columns(sample=pl.lit("audit_panel_2")),
     ])
     assert samples["s1_id"].n_unique() == samples.height
-    print(f"\nretrieving for {samples.height:,} training queries ({fit_ids.len():,} fit + 3 x 20,000)")
+    print(f"\nretrieving for {samples.height:,} training queries ({fit_ids.len():,} fit + 4 x 20,000)")
     t0 = time.time()
     cands, timings = retrieve(norm_train, samples["s1_id"])
     cands = cands.join(samples, on="s1_id", how="left")
@@ -101,7 +106,7 @@ def main() -> None:
 
     pairs = load_label_pairs()
     report = {}
-    for sample in ("tune_sample", "fit_sample", "c_select_sample", "audit_panel"):
+    for sample in ("tune_sample", "fit_sample", "c_select_sample", "audit_panel", "audit_panel_2"):
         ids = samples.filter(pl.col("sample") == sample)["s1_id"]
         report[sample] = candidate_report(cands, pairs, ids, norm_train)
     with open(C.WORK_DIR / "retrieval_report.json", "w", encoding="utf-8") as f:
@@ -109,7 +114,9 @@ def main() -> None:
     print("\nretrieval report (Tune sample):")
     print(json.dumps(report["tune_sample"], indent=2, default=float))
     for sample, r in report.items():
-        print(f"{sample}: recall {r['candidate_recall']:.4f}, oracle F0.5 {r['candidate_oracle']['macro_f05']:.4f}, "
+        missing = r["recall_by_addr_missing"].get("True", {}).get("recall", float("nan"))
+        print(f"{sample}: recall {r['candidate_recall']:.4f} (missing address {missing:.4f}, found only by fallback "
+              f"{r['true_links_found_only_by_fallback']:.4f}), oracle F0.5 {r['candidate_oracle']['macro_f05']:.4f}, "
               f"{r['mean_candidates_per_s1']:.1f} candidates/S1")
 
 

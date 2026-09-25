@@ -4,6 +4,7 @@ Run from the repository root:  python -m plan1.step5_infer
 Restartable: finished batches are saved under work/plan1/<run>/test_chunks/ and skipped on rerun.
 Outputs: output/plan1/<run>/candidate_pairs.tsv and matching_results.tsv (every test S1 has a row).
 matching_results.tsv applies one owner per record; the version without it is kept in the work dir.
+Variant: output/plan1/<run>-crowd<N>/matching_results.tsv also drops records accepted for N+ S1 (leaderboard test).
 
 Test indexes are fitted on the same-country TEST targets with the same settings (unlabelled text, no labels).
 Features are streamed per batch; each chunk keeps (s1_id, target_id, source, retrieval score, rank, model p),
@@ -18,16 +19,16 @@ import polars as pl
 
 from . import config as C
 from .dataio import read_id_lists, test_s1_roster, write_id_lists
-from .decide import one_owner
+from .decide import drop_crowded, one_owner
 from .features import FEATURES, build_features, matrix, text_lookup
 from .normalize import NORMALIZE_VERSION
-from .retrieve import QUERY_BATCH, TargetIndex, add_rank
+from .retrieve import QUERY_BATCH, build_indexes, search_batch
 from .step2_retrieve import normalized
 from .step4_threshold import sha256
 
 CHUNK_DIR = C.WORK_DIR / "test_chunks"
 CHUNK_SCHEMA = {"s1_id": pl.String, "target_id": pl.String, "source": pl.String, "score": pl.Float32,
-                "rank": pl.Int32, "p": pl.Float32}
+                "rank": pl.Int32, "fb_score": pl.Float32, "p": pl.Float32}
 
 
 def chunk_path(country: str, batch_no: int):
@@ -35,16 +36,15 @@ def chunk_path(country: str, batch_no: int):
 
 
 def score_batch(qb: pl.DataFrame, indexes: dict, norm: pl.DataFrame, booster: lgb.Booster) -> pl.DataFrame:
-    parts = [idx.query(qb).with_columns(source=pl.lit(src)) for src, idx in indexes.items()]
-    cands = pl.concat(parts) if parts else pl.DataFrame(schema={"s1_id": pl.String, "target_id": pl.String, "score": pl.Float32, "source": pl.String})
+    cands = search_batch(qb, indexes)
     if cands.height == 0:
         return pl.DataFrame(schema=CHUNK_SCHEMA)
-    cands = add_rank(cands)
     q, t = text_lookup(norm, cands["s1_id"], cands["target_id"])
     feats = build_features(cands, q, t)
     return feats.select(
         "s1_id", "target_id", "source",
         score=pl.col("retrieval_score").cast(pl.Float32), rank=pl.col("retrieval_rank").cast(pl.Int32),
+        fb_score=pl.col("fallback_name_score").cast(pl.Float32),
     ).with_columns(p=pl.Series(booster.predict(matrix(feats)), dtype=pl.Float32))
 
 
@@ -82,12 +82,10 @@ def main() -> None:
         if not todo:
             continue
         t0 = time.time()
-        indexes = {}
-        for src in C.TARGET_SOURCES:
-            t = norm.filter((pl.col("source") == src) & (pl.col("country") == country))
-            if t.height:
-                indexes[src] = TargetIndex(t)
-                print(f"  index {src}: {t.height:,} targets, vocab {indexes[src].vocabulary_size:,}")
+        indexes = build_indexes(norm, country)
+        for src, (main, fb) in indexes.items():
+            print(f"  index {src}: {main.ids.len():,} targets, vocab {main.vocabulary_size:,}; "
+                  f"no-address fallback {fb.ids.len() if fb else 0:,}")
         print(f"  indexes built in {time.time() - t0:.0f}s")
         for i, start in enumerate(todo, 1):
             t1 = time.time()
@@ -120,6 +118,18 @@ def main() -> None:
     write_id_lists(scored, roster, cand_path, "candidate_entity_ids")
     write_id_lists(matches, roster, match_path, "matched_entity_ids")
     write_id_lists(accepted, roster, C.WORK_DIR / "matching_results_no_owner.tsv", "matched_entity_ids")
+
+    # ---- variant for the leaderboard: drop records accepted for CROWD_LIMIT+ businesses, then one owner ----
+    claims = accepted.group_by("target_id").agg(n=pl.col("s1_id").n_unique())
+    print("\nrecords by number of accepting S1 (links in brackets):")
+    for k in (2, 3, 5, 10, 20, 50):
+        sel = claims.filter(pl.col("n") >= k)
+        print(f"  >= {k:>2}: {sel.height:,} records ({int(sel['n'].sum()):,} links)")
+    crowd_matches = one_owner(drop_crowded(accepted, C.CROWD_LIMIT))
+    crowd_path = C.ROOT / "output" / "plan1" / f"{C.RUN_ID}-crowd{C.CROWD_LIMIT}" / "matching_results.tsv"
+    write_id_lists(crowd_matches, roster, crowd_path, "matched_entity_ids")
+    print(f"crowd variant: drops records accepted {C.CROWD_LIMIT}+ times -> {crowd_matches.height:,} links "
+          f"({matches.height - crowd_matches.height:,} fewer than the main file): {crowd_path}")
 
     # ---- internal checks on the written files (the official validator only warns on some of these) ----
     cand_back = read_id_lists(cand_path, "candidate_entity_ids")

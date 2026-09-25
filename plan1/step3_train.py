@@ -1,8 +1,8 @@
-"""Step 3: build the 12 features for the Fit and Tune candidates, label them, train one LightGBM model.
+"""Step 3: build the features for the Fit and Tune candidates, label them, train one LightGBM model.
 
 Run from the repository root:  python -m plan1.step3_train
 Needs step 2's outputs from the current normalization version.
-Outputs (under work/plan1/p1-baseline-v1/): model.txt, model_meta.json, tune_predictions.parquet
+Outputs (under work/plan1/<run>/): model.txt, model_meta.json, tune_predictions.parquet
 """
 import json
 import time
@@ -16,6 +16,7 @@ from . import config as C
 from .dataio import load_label_pairs
 from .features import FEATURES, build_features, matrix, text_lookup
 from .metric import score
+from .model import train_lgb
 from .normalize import NORMALIZE_VERSION
 from .splits import fit_sample_ids
 
@@ -62,14 +63,7 @@ def main() -> None:
     # ---- one LightGBM model, early stopping on Tune ----
     x_fit, y_fit = matrix(fit), fit["label"].to_numpy()
     x_tune, y_tune = matrix(tune), tune["label"].to_numpy()
-    d_fit = lgb.Dataset(x_fit, y_fit, feature_name=FEATURES, free_raw_data=False)
-    d_tune = lgb.Dataset(x_tune, y_tune, feature_name=FEATURES, reference=d_fit, free_raw_data=False)
-    t0 = time.time()
-    booster = lgb.train(
-        C.LGB_PARAMS, d_fit, num_boost_round=C.LGB_MAX_ROUNDS, valid_sets=[d_tune], valid_names=["tune"],
-        callbacks=[lgb.early_stopping(C.LGB_EARLY_STOPPING, verbose=True), lgb.log_evaluation(100)],
-    )
-    train_s = time.time() - t0
+    booster, train_s = train_lgb(x_fit, y_fit, x_tune, y_tune, FEATURES)
     best = booster.best_iteration
     p_tune = booster.predict(x_tune, num_iteration=best)
     print(f"\ntrained in {train_s:.0f}s, best iteration {best}")

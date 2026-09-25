@@ -104,6 +104,18 @@ def sample_ids(manifest: pl.DataFrame, sample: str) -> pl.Series:
     return manifest.filter(pl.col("sample") == sample)["s1_id"]
 
 
+def fresh_audit_panel(manifest: pl.DataFrame) -> pl.Series:
+    """20k Audit-role S1 outside the first audit_panel (new salt), saved once to audit_panel_2.tsv and reused."""
+    path = C.SPLIT_DIR / "audit_panel_2.tsv"
+    if path.exists():
+        return pl.read_csv(path, separator="\t", infer_schema=False)["s1_id"]
+    pool = manifest.filter((pl.col("role") == "audit") & pl.col("sample").is_null()).select("s1_id", "country", "band")
+    pool = pool.with_columns(sample_u=pl.Series(stable_unit(pool["s1_id"].to_list(), C.AUDIT_PANEL_2_SALT)))
+    ids = stratified_take(pool, C.AUDIT_PANEL_2_SIZE)["s1_id"]
+    pl.DataFrame({"s1_id": ids}).write_csv(path, separator="\t")
+    return ids
+
+
 def fit_sample_ids(manifest: pl.DataFrame, n: int) -> pl.Series:
     """A proportional draw of n S1 from the Fit role, same salt and ordering as the saved samples
     (so the saved 100k fit_sample is contained in any larger draw). The manifest itself is not changed."""
