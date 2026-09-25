@@ -23,7 +23,7 @@ from .decide import drop_crowded, one_owner
 from .features import FEATURES, build_features, matrix, text_lookup
 from .normalize import NORMALIZE_VERSION
 from .retrieve import QUERY_BATCH, build_indexes, search_batch
-from .step2_retrieve import normalized
+from .enrich import enriched
 from .step4_threshold import sha256
 
 CHUNK_DIR = C.WORK_DIR / "test_chunks"
@@ -58,7 +58,7 @@ def main() -> None:
     thr = frozen["threshold"]
     print(f"frozen threshold {thr}, model {frozen['model_sha256'][:12]}")
 
-    norm = normalized("test")
+    norm = enriched("test")
     queries = norm.filter(pl.col("source") == "S1").sort("entity_id")
     roster = test_s1_roster()  # rows are written in test_source1.tsv order
     assert set(roster.to_list()) == set(queries["entity_id"].to_list())

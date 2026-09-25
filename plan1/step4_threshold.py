@@ -17,6 +17,7 @@ from . import config as C
 from .dataio import load_label_pairs
 from .features import FEATURES, matrix
 from .metric import per_s1, score, summarize
+from .enrich import enriched
 from .normalize import NORMALIZE_VERSION
 from .retrieve import TFIDF_PARAMS, TOP_K, candidate_report
 from .splits import fresh_audit_panel
@@ -57,7 +58,7 @@ def main() -> None:
     model_meta = json.loads((C.WORK_DIR / "model_meta.json").read_text(encoding="utf-8"))
     assert model_meta["features"] == FEATURES and model_meta["normalize_version"] == NORMALIZE_VERSION
 
-    norm = pl.read_parquet(C.WORK_DIR / f"normalized_train_v{NORMALIZE_VERSION}.parquet")
+    norm = enriched("train")
     cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
     pairs = load_label_pairs()
     manifest = pl.read_parquet(C.SPLIT_DIR / "manifest.parquet")

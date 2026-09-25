@@ -6,8 +6,6 @@ Why: search finds ~98.9% of true links but the first-stage model, which judges o
     score, how many candidates score >= 0.5 / 0.8, sum of scores, best score in the other source;
   - duplicates: similarity to the business's likely records (first-stage score >= STAGE2_ANCHOR_P), the best score
     among near-identical likely records, and how many there are;
-  - frequency, counted within each split: how common the S1's name is among S1s, and the record's name and address
-    among S2/S3 of the same country (generic names need address evidence).
 First-stage scores for the Fit sample come from STAGE2_FOLDS models that never saw those businesses (out of fold);
 Tune / C-select / panels / test use the full first-stage model. Candidates are reused: no new search.
 
@@ -31,7 +29,7 @@ from .metric import per_s1, score, summarize
 from .model import best_iteration, importance, load_model, predict, save_model, train_model
 from .normalize import NORMALIZE_VERSION
 from .splits import fit_sample_ids, fresh_audit_panel, stable_unit
-from .step2_retrieve import normalized
+from .enrich import FEATURES_VERSION, enriched
 from .step3_train import labelled_features
 from .step4_threshold import pick, sweep
 
@@ -44,30 +42,11 @@ STAGE2_FEATURES = [
     "p1", "p1_rank", "p1_rank_src", "p1_max", "p1_second", "p1_rel", "p1_gap", "n_p50", "n_p80", "p1_sum",
     "p1_max_other_src",
     "sib_name", "sib_addr", "sib_both", "sib_p", "n_sib",
-    "q_name_s1_rate", "t_name_rate", "t_addr_rate",
-]
+]  # name/address frequency features now live in stage 1 (features.TRAP_FEATURES)
 ALL_FEATURES = FEATURES + STAGE2_FEATURES
 
 
 # ---------------------------------------------------------------- features
-def frequency_rates(norm: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Per 100k records of the same split and country: S1 name among S1s; record name / address among S2+S3."""
-    s1 = norm.filter(pl.col("source") == "S1")
-    tg = norm.filter(pl.col("source") != "S1")
-    s1_tot = s1.group_by("country").agg(n=pl.len())
-    tg_tot = tg.group_by("country").agg(n=pl.len())
-    rate = (pl.col("c") / pl.col("n") * 1e5).cast(F32)
-    q = s1.group_by("country", "name_red").agg(c=pl.len()).join(s1_tot, on="country").select("country", "name_red", q_name_s1_rate=rate)
-    tn = tg.group_by("country", "name_red").agg(c=pl.len()).join(tg_tot, on="country").select("country", "name_red", t_name_rate=rate)
-    ta = (tg.filter(pl.col("addr_norm") != "").group_by("country", "addr_norm").agg(c=pl.len()).join(tg_tot, on="country")
-          .select("country", "addr_norm", t_addr_rate=rate))
-    s1_rates = s1.select(s1_id="entity_id", country="country", name_red="name_red").join(q, on=["country", "name_red"], how="left").select("s1_id", "q_name_s1_rate")
-    t_rates = (tg.select(target_id="entity_id", country="country", name_red="name_red", addr_norm="addr_norm")
-               .join(tn, on=["country", "name_red"], how="left").join(ta, on=["country", "addr_norm"], how="left")
-               .select("target_id", "t_name_rate", "t_addr_rate"))
-    return s1_rates, t_rates
-
-
 def _sibling_features(df: pl.DataFrame, txt: pl.DataFrame) -> pl.DataFrame:
     """df: s1_id, target_id, p1 for whole S1s. Similarity of each candidate to the S1's likely records."""
     anchors = df.filter(pl.col("p1") >= C.STAGE2_ANCHOR_P).select("s1_id", anchor_id="target_id", anchor_p="p1")
@@ -89,7 +68,7 @@ def _sibling_features(df: pl.DataFrame, txt: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def add_stage2_features(feats: pl.DataFrame, txt: pl.DataFrame, s1_rates: pl.DataFrame, t_rates: pl.DataFrame) -> pl.DataFrame:
+def add_stage2_features(feats: pl.DataFrame, txt: pl.DataFrame) -> pl.DataFrame:
     """feats: s1_id, target_id, source, FEATURES..., p1 (all candidates of each S1 present). txt: target_id, n, a."""
     p = pl.col("p1")
     out = feats.with_columns(p1=p.cast(F32)).with_columns(
@@ -111,11 +90,8 @@ def add_stage2_features(feats: pl.DataFrame, txt: pl.DataFrame, s1_rates: pl.Dat
                           .select("s1_id", "target_id", "p1"), txt)
         for i in range(0, s1_list.len(), SIB_BATCH)
     ])
-    out = (out.join(sib, on=["s1_id", "target_id"], how="left", maintain_order="left")
-           .with_columns(pl.col("n_sib").fill_null(0))
-           .join(s1_rates, on="s1_id", how="left", maintain_order="left")
-           .join(t_rates, on="target_id", how="left", maintain_order="left"))
-    return out
+    return (out.join(sib, on=["s1_id", "target_id"], how="left", maintain_order="left")
+            .with_columns(pl.col("n_sib").fill_null(0)))
 
 
 def text_table(norm: pl.DataFrame, target_ids: pl.Series) -> pl.DataFrame:
@@ -150,7 +126,7 @@ def main_train() -> None:
     frozen = json.loads((C.WORK_DIR / "frozen_config.json").read_text(encoding="utf-8"))
     backend = C.MODEL_BACKEND
     S2_DIR.mkdir(parents=True, exist_ok=True)
-    norm = pl.read_parquet(C.WORK_DIR / f"normalized_train_v{NORMALIZE_VERSION}.parquet")
+    norm = enriched("train")
     cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
     pairs = load_label_pairs()
     manifest = pl.read_parquet(C.SPLIT_DIR / "manifest.parquet")
@@ -166,7 +142,7 @@ def main_train() -> None:
 
     feats = {}
     for k, v in ids.items():
-        path = S2_DIR / f"stage1_features_{k}.parquet"
+        path = S2_DIR / f"stage1_features_{k}_f{FEATURES_VERSION}.parquet"
         if path.exists():
             feats[k] = pl.read_parquet(path)
         else:
@@ -176,7 +152,9 @@ def main_train() -> None:
     x_fit, x_tune = matrix(feats["fit"]), matrix(feats["tune"])
 
     # ---- first stage: full model + out-of-fold scores for Fit ----
-    if backend == "lightgbm" and (C.WORK_DIR / "model.txt").exists():
+    run_meta = C.WORK_DIR / "model_meta.json"
+    reusable = run_meta.exists() and json.loads(run_meta.read_text(encoding="utf-8")).get("features") == FEATURES
+    if backend == "lightgbm" and reusable and (C.WORK_DIR / "model.txt").exists():
         stage1_path = C.WORK_DIR / "model.txt"
         stage1 = load_model(stage1_path)
         print(f"first stage: reusing {stage1_path} (LightGBM)")
@@ -200,11 +178,10 @@ def main_train() -> None:
 
     # ---- second-stage features ----
     t0 = time.time()
-    s1_rates, t_rates = frequency_rates(norm)
     s2 = {}
     for k in feats:
         f = feats[k].with_columns(p1=pl.Series(p1[k]))
-        s2[k] = add_stage2_features(f, text_table(norm, f["target_id"]), s1_rates, t_rates)
+        s2[k] = add_stage2_features(f, text_table(norm, f["target_id"]))
     print(f"second-stage features in {time.time() - t0:.0f}s")
 
     # ---- second-stage model ----
@@ -252,8 +229,7 @@ def main_test() -> None:
     files = sorted(chunk_dir.glob("*.parquet"))
     if not files:
         raise RuntimeError(f"no test chunks in {chunk_dir}: run step 5 first")
-    norm = normalized("test")
-    s1_rates, t_rates = frequency_rates(norm)
+    norm = enriched("test")
     TEST_DIR.mkdir(parents=True, exist_ok=True)
     t_all = time.time()
     for i, f in enumerate(files, 1):
@@ -277,7 +253,7 @@ def main_test() -> None:
         else:
             p1 = predict(stage1, matrix(feats))
         feats = feats.with_columns(p1=pl.Series(p1, dtype=F32))
-        s2f = add_stage2_features(feats, text_table(norm, feats["target_id"]), s1_rates, t_rates)
+        s2f = add_stage2_features(feats, text_table(norm, feats["target_id"]))
         p2 = predict(model2, matrix(s2f, ALL_FEATURES))
         tmp = out_path.with_suffix(".tmp")
         s2f.select("s1_id", "target_id", "source", "p1").with_columns(p=pl.Series(p2, dtype=F32)).write_parquet(tmp)

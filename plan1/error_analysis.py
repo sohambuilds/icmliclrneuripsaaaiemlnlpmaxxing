@@ -22,6 +22,7 @@ from . import config as C
 from .dataio import load_label_pairs, load_records
 from .features import matrix
 from .metric import per_s1, score
+from .enrich import enriched
 from .normalize import NORMALIZE_VERSION
 from .retrieve import TOP_K
 from .step3_train import labelled_features
@@ -56,7 +57,7 @@ def main() -> None:
     frozen = json.loads((C.WORK_DIR / "frozen_config.json").read_text(encoding="utf-8"))
     thr = frozen["threshold"]
     booster = lgb.Booster(model_file=str(C.WORK_DIR / "model.txt"))
-    norm = pl.read_parquet(C.WORK_DIR / f"normalized_train_v{NORMALIZE_VERSION}.parquet")
+    norm = enriched("train")
     cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
     pairs = load_label_pairs()
     manifest = pl.read_parquet(C.SPLIT_DIR / "manifest.parquet")

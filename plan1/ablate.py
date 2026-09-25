@@ -23,6 +23,7 @@ from .dataio import load_label_pairs, load_records
 from .features import BASE_FEATURES, FEATURE_GROUPS, FEATURES, matrix
 from .metric import per_s1, score, summarize
 from .model import best_iteration, predict, train_model
+from .enrich import FEATURES_VERSION, enrich_frame, enriched
 from .normalize import NORMALIZE_VERSION, normalize_records
 from .retrieve import TOP_K, candidate_report, retrieve
 from .splits import fit_sample_ids
@@ -54,7 +55,7 @@ def sample_ids() -> dict[str, pl.Series]:
 def feature_sets(cands: pl.DataFrame, norm: pl.DataFrame, pairs: pl.DataFrame, ids: dict, cache: str) -> dict:
     out = {}
     for s in SETS:
-        path = ABL_DIR / cache / f"features_{s}.parquet"
+        path = ABL_DIR / f"{cache}_f{FEATURES_VERSION}" / f"features_{s}.parquet"
         if path.exists():
             out[s] = pl.read_parquet(path)
             continue
@@ -117,7 +118,7 @@ def main(mode: str, variant: str | None = None) -> None:
     rows = []
 
     if mode == "features":
-        norm = pl.read_parquet(C.WORK_DIR / f"normalized_train_v{NORMALIZE_VERSION}.parquet")
+        norm = enriched("train")
         cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
         recall = candidate_report(cands, pairs, ids["dev"], norm)["candidate_recall"]
         feats = feature_sets(cands, norm, pairs, ids, "full")
@@ -135,7 +136,7 @@ def main(mode: str, variant: str | None = None) -> None:
 
     elif mode == "backends":
         # same features, sample and threshold procedure; only the tree library differs
-        norm = pl.read_parquet(C.WORK_DIR / f"normalized_train_v{NORMALIZE_VERSION}.parquet")
+        norm = enriched("train")
         cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
         recall = candidate_report(cands, pairs, ids["dev"], norm)["candidate_recall"]
         feats = feature_sets(cands, norm, pairs, ids, "full")
@@ -147,13 +148,13 @@ def main(mode: str, variant: str | None = None) -> None:
         if variant not in CLEANUP:
             raise SystemExit(f"cleanup variant must be one of {list(CLEANUP)}")
         kwargs = {"to_latin": make_converter(translit_map()), **CLEANUP[variant]}
-        norm_path = ABL_DIR / variant / "normalized_train.parquet"
+        norm_path = ABL_DIR / variant / f"enriched_train_f{FEATURES_VERSION}.parquet"
         cand_path = ABL_DIR / variant / "candidates.parquet"
         if norm_path.exists():
             norm = pl.read_parquet(norm_path)
         else:
             t0 = time.time()
-            norm = normalize_records(load_records("train"), **kwargs)
+            norm = enrich_frame(normalize_records(load_records("train"), **kwargs), load_records("train"))
             norm_path.parent.mkdir(parents=True, exist_ok=True)
             norm.write_parquet(norm_path)
             print(f"{variant}: cleaned train in {time.time() - t0:.0f}s")

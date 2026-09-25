@@ -17,6 +17,7 @@ from .dataio import load_label_pairs
 from .features import FEATURES, build_features, matrix, text_lookup
 from .metric import score
 from .model import train_lgb
+from .enrich import enriched
 from .normalize import NORMALIZE_VERSION
 from .splits import fit_sample_ids
 
@@ -37,7 +38,7 @@ def main() -> None:
     if meta["normalize_version"] != NORMALIZE_VERSION:
         raise RuntimeError(f"candidates were built with normalize v{meta['normalize_version']}, code is v{NORMALIZE_VERSION}: rerun step 2")
 
-    norm = pl.read_parquet(C.WORK_DIR / f"normalized_train_v{NORMALIZE_VERSION}.parquet")
+    norm = enriched("train")
     cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
     pairs = load_label_pairs()
     manifest = pl.read_parquet(C.SPLIT_DIR / "manifest.parquet")
