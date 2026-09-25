@@ -1,28 +1,26 @@
-"""Step 5b: one owner per S2/S3 record, applied to the saved test scores (no retrieval, no model run).
+"""Step 5b: one owner per S2/S3 record, applied to a finished run's saved test scores (no retrieval, no model).
 
-In the training labels every S2/S3 record belongs to at most one S1. When a record is accepted for several S1s,
-keep it only for the S1 with the highest model score (ties -> smallest S1 id). Candidates are unchanged.
-
-Run from the repository root:  python -m plan1.step5b_one_owner
-Outputs: output/plan1/p1-baseline-v1-owner/{candidate_pairs.tsv, matching_results.tsv}
+For the baseline run:  AMC_RUN_ID=p1-baseline-v1 python -m plan1.step5b_one_owner
+(Runs from p1-v2 on already apply the rule inside step 5.)
+Outputs: output/plan1/<run>-owner/{candidate_pairs.tsv, matching_results.tsv}
 """
 import json
 
 import polars as pl
 
 from . import config as C
-from .dataio import write_id_lists
-from .normalize import NORMALIZE_VERSION
-from .step5_infer import CHUNK_DIR
+from .dataio import load_records, write_id_lists
+from .decide import one_owner
 
+CHUNK_DIR = C.WORK_DIR / "test_chunks"
 OUT = C.ROOT / "output" / "plan1" / f"{C.RUN_ID}-owner"
 
 
 def main() -> None:
+    print("run:", C.RUN_ID)
     thr = json.loads((C.WORK_DIR / "frozen_config.json").read_text(encoding="utf-8"))["threshold"]
     scored = pl.read_parquet(str(CHUNK_DIR / "*.parquet"))
-    s1 = (pl.read_parquet(C.WORK_DIR / f"normalized_test_v{NORMALIZE_VERSION}.parquet", columns=["entity_id", "source", "country"])
-          .filter(pl.col("source") == "S1").select(s1_id="entity_id", country="country"))
+    s1 = load_records("test").filter(pl.col("source") == "S1").select(s1_id="entity_id", country="country")
     roster = s1["s1_id"].sort()
 
     accepted = scored.filter(pl.col("p") >= thr).join(s1, on="s1_id")
@@ -31,27 +29,22 @@ def main() -> None:
         claimants=pl.len().over("target_id"),
         p_top=pl.col("p").first().over("target_id"),
     )
-    kept = ranked.filter(pl.col("claim_rank") == 0)
+    kept = one_owner(accepted)
     dropped = ranked.filter(pl.col("claim_rank") > 0)
+    assert kept.height == ranked.filter(pl.col("claim_rank") == 0).height
 
-    contested = ranked.filter(pl.col("claimants") > 1)
     print(f"accepted links {accepted.height:,} -> kept {kept.height:,}, dropped {dropped.height:,}")
     print("\nby S1 country:")
     print(ranked.group_by("country").agg(
         accepted=pl.len(),
         contested_links=(pl.col("claimants") > 1).sum(),
         dropped=(pl.col("claim_rank") > 0).sum(),
-        contested_targets=pl.col("target_id").filter(pl.col("claimants") > 1).n_unique(),
     ).with_columns(dropped_share=pl.col("dropped") / pl.col("accepted")).sort("country"))
     print("\nclaimants per contested record:")
-    print(contested.group_by("target_id").agg(n=pl.first("claimants")).group_by("n").len().sort("n"))
-    margin = dropped.filter(pl.col("claim_rank") == 1).select(gap=pl.col("p_top") - pl.col("p"))
+    print(ranked.filter(pl.col("claimants") > 1).group_by("target_id").agg(n=pl.first("claimants")).group_by("n").len().sort("n"))
     print("\nscore gap between the winner and the runner-up:")
-    print(margin.select(
-        median=pl.col("gap").median(),
-        under_0_05=(pl.col("gap") < 0.05).mean(),
-        under_0_10=(pl.col("gap") < 0.10).mean(),
-    ))
+    print(dropped.filter(pl.col("claim_rank") == 1).select(gap=pl.col("p_top") - pl.col("p")).select(
+        median=pl.col("gap").median(), under_0_05=(pl.col("gap") < 0.05).mean(), under_0_10=(pl.col("gap") < 0.10).mean()))
 
     per = (pl.DataFrame({"s1_id": roster}).join(s1, on="s1_id")
            .join(accepted.group_by("s1_id").agg(before=pl.len()), on="s1_id", how="left")

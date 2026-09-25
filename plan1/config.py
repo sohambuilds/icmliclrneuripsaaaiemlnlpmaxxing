@@ -7,7 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get("AMC_DATA_DIR", ROOT / "dataset"))
-RUN_ID = "p1-baseline-v1"
+# p1-baseline-v1: the frozen Plan 1 baseline (code as of its run). p1-v2: + quick fixes (see normalize.py, features.py).
+# Set AMC_RUN_ID=p1-baseline-v1 only for scripts that just read that run's saved outputs (e.g. step5b).
+RUN_ID = os.environ.get("AMC_RUN_ID", "p1-v2")
 
 SHARED_DIR = ROOT / "work" / "shared"  # raw caches and the split manifest, shared by all plans
 RAW_DIR = SHARED_DIR / "raw"
@@ -32,6 +34,8 @@ SAMPLE_SIZES = {  # sample name -> (pool it is drawn from, size)
     "audit_panel": ("audit", 20_000),
 }
 MAX_BAND = 6  # true-match-count bands 0,1,...,5,6+ used to stratify samples
+# p1-v2 trains on a larger draw from the Fit role (same stratification and sample salt; contains the 100k sample)
+FIT_SAMPLE_SIZE = 300_000
 
 SEED = 42
 

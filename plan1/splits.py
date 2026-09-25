@@ -102,3 +102,11 @@ def load_or_build_manifest(s1: pl.DataFrame, pairs: pl.DataFrame, force: bool = 
 
 def sample_ids(manifest: pl.DataFrame, sample: str) -> pl.Series:
     return manifest.filter(pl.col("sample") == sample)["s1_id"]
+
+
+def fit_sample_ids(manifest: pl.DataFrame, n: int) -> pl.Series:
+    """A proportional draw of n S1 from the Fit role, same salt and ordering as the saved samples
+    (so the saved 100k fit_sample is contained in any larger draw). The manifest itself is not changed."""
+    pool = manifest.filter(pl.col("pool") == "fit").select("s1_id", "country", "band")
+    pool = pool.with_columns(sample_u=pl.Series(stable_unit(pool["s1_id"].to_list(), C.SAMPLE_SALT)))
+    return stratified_take(pool, n)["s1_id"]

@@ -17,6 +17,7 @@ from .dataio import load_label_pairs
 from .features import FEATURES, build_features, matrix, text_lookup
 from .metric import score
 from .normalize import NORMALIZE_VERSION
+from .splits import fit_sample_ids
 
 
 def labelled_features(cands: pl.DataFrame, pairs: pl.DataFrame, norm: pl.DataFrame, name: str) -> pl.DataFrame:
@@ -39,9 +40,9 @@ def main() -> None:
     cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
     pairs = load_label_pairs()
     manifest = pl.read_parquet(C.SPLIT_DIR / "manifest.parquet")
-    fit_ids = manifest.filter(pl.col("sample") == "fit_sample")["s1_id"]
+    fit_ids = fit_sample_ids(manifest, C.FIT_SAMPLE_SIZE)
     tune_ids = manifest.filter(pl.col("sample") == "tune_sample")["s1_id"]
-    assert fit_ids.len() == C.SAMPLE_SIZES["fit_sample"][1], f"fit sample has {fit_ids.len()} rows: rebuild the manifest"
+    assert fit_ids.len() == C.FIT_SAMPLE_SIZE == meta["fit_sample_size"], "fit sample size differs from step 2: rerun step 2"
     assert not set(fit_ids.to_list()) & set(tune_ids.to_list()), "Fit and Tune share S1s"
 
     fit = labelled_features(cands.join(pl.DataFrame({"s1_id": fit_ids}), on="s1_id", how="semi"), pairs, norm, "fit")

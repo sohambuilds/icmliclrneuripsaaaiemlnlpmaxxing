@@ -1,11 +1,13 @@
 """Step 5: full test inference with the frozen configuration, in checkpointed batches; writes both output files.
 
 Run from the repository root:  python -m plan1.step5_infer
-Restartable: finished batches are saved under work/plan1/p1-baseline-v1/test_chunks/ and skipped on rerun.
-Outputs: output/plan1/p1-baseline-v1/candidate_pairs.tsv and matching_results.tsv (every test S1 has a row).
+Restartable: finished batches are saved under work/plan1/<run>/test_chunks/ and skipped on rerun.
+Outputs: output/plan1/<run>/candidate_pairs.tsv and matching_results.tsv (every test S1 has a row).
+matching_results.tsv applies one owner per record; the version without it is kept in the work dir.
 
 Test indexes are fitted on the same-country TEST targets with the same settings (unlabelled text, no labels).
-Features are streamed per batch; only (s1_id, target_id, source, score p) is kept.
+Features are streamed per batch; each chunk keeps (s1_id, target_id, source, retrieval score, rank, model p),
+so a later model can reuse the test candidates without repeating retrieval.
 """
 import json
 import re
@@ -16,14 +18,16 @@ import polars as pl
 
 from . import config as C
 from .dataio import read_id_lists, write_id_lists
-from .features import build_features, matrix, text_lookup
+from .decide import one_owner
+from .features import FEATURES, build_features, matrix, text_lookup
 from .normalize import NORMALIZE_VERSION
 from .retrieve import QUERY_BATCH, TargetIndex, add_rank
 from .step2_retrieve import normalized
 from .step4_threshold import sha256
 
 CHUNK_DIR = C.WORK_DIR / "test_chunks"
-CHUNK_SCHEMA = {"s1_id": pl.String, "target_id": pl.String, "source": pl.String, "p": pl.Float32}
+CHUNK_SCHEMA = {"s1_id": pl.String, "target_id": pl.String, "source": pl.String, "score": pl.Float32,
+                "rank": pl.Int32, "p": pl.Float32}
 
 
 def chunk_path(country: str, batch_no: int):
@@ -38,7 +42,10 @@ def score_batch(qb: pl.DataFrame, indexes: dict, norm: pl.DataFrame, booster: lg
     cands = add_rank(cands)
     q, t = text_lookup(norm, cands["s1_id"], cands["target_id"])
     feats = build_features(cands, q, t)
-    return feats.select("s1_id", "target_id", "source").with_columns(p=pl.Series(booster.predict(matrix(feats)), dtype=pl.Float32))
+    return feats.select(
+        "s1_id", "target_id", "source",
+        score=pl.col("retrieval_score").cast(pl.Float32), rank=pl.col("retrieval_rank").cast(pl.Int32),
+    ).with_columns(p=pl.Series(booster.predict(matrix(feats)), dtype=pl.Float32))
 
 
 def main() -> None:
@@ -57,7 +64,8 @@ def main() -> None:
     CHUNK_DIR.mkdir(parents=True, exist_ok=True)
     # chunks hold model scores: never mix chunks from a different model or normalization
     chunk_meta = CHUNK_DIR / "chunk_meta.json"
-    this_run = {"model_sha256": frozen["model_sha256"], "normalize_version": NORMALIZE_VERSION, "batch": QUERY_BATCH}
+    this_run = {"model_sha256": frozen["model_sha256"], "normalize_version": NORMALIZE_VERSION, "batch": QUERY_BATCH,
+                "features": FEATURES}
     if chunk_meta.exists():
         if json.loads(chunk_meta.read_text(encoding="utf-8")) != this_run:
             raise RuntimeError(f"{CHUNK_DIR} holds chunks from another configuration; move it away first")
@@ -100,12 +108,17 @@ def main() -> None:
         raise RuntimeError("duplicate (s1, target) candidates")
     if scored.join(pl.DataFrame({"s1_id": roster}), on="s1_id", how="anti").height:
         raise RuntimeError("candidates for S1 ids outside the test roster")
-    matches = scored.filter(pl.col("p") >= thr)
+    accepted = scored.filter(pl.col("p") >= thr)
+    matches = one_owner(accepted)
+    collisions = accepted.group_by("target_id").agg(n=pl.col("s1_id").n_unique()).filter(pl.col("n") > 1).height
+    print(f"\naccepted {accepted.height:,} links; {collisions:,} records accepted for 2+ S1; "
+          f"one owner per record keeps {matches.height:,} (drops {accepted.height - matches.height:,})")
 
     cand_path = C.OUT_DIR / "candidate_pairs.tsv"
     match_path = C.OUT_DIR / "matching_results.tsv"
     write_id_lists(scored, roster, cand_path, "candidate_entity_ids")
     write_id_lists(matches, roster, match_path, "matched_entity_ids")
+    write_id_lists(accepted, roster, C.WORK_DIR / "matching_results_no_owner.tsv", "matched_entity_ids")
 
     # ---- internal checks on the written files (the official validator only warns on some of these) ----
     cand_back = read_id_lists(cand_path, "candidate_entity_ids")
@@ -127,17 +140,19 @@ def main() -> None:
     # ---- diagnostics ----
     per = (pl.DataFrame({"s1_id": roster}).join(queries.select(s1_id="entity_id", country="country"), on="s1_id")
            .join(scored.group_by("s1_id").agg(n_cand=pl.len()), on="s1_id", how="left")
+           .join(accepted.group_by("s1_id").agg(n_accepted=pl.len()), on="s1_id", how="left")
            .join(matches.group_by("s1_id").agg(n_match=pl.len()), on="s1_id", how="left")
-           .with_columns(pl.col("n_cand", "n_match").fill_null(0)))
+           .with_columns(pl.col("n_cand", "n_accepted", "n_match").fill_null(0)))
     diag = per.group_by("country").agg(
         s1=pl.len(), mean_candidates=pl.col("n_cand").mean(), no_candidates=(pl.col("n_cand") == 0).sum(),
-        mean_matches=pl.col("n_match").mean(), empty_answer_rate=(pl.col("n_match") == 0).mean(),
+        mean_accepted=pl.col("n_accepted").mean(), mean_matches=pl.col("n_match").mean(),
+        empty_before_owner=(pl.col("n_accepted") == 0).mean(), empty_answer_rate=(pl.col("n_match") == 0).mean(),
     ).sort("country")
     print(diag)
-    collisions = matches.group_by("target_id").agg(n=pl.col("s1_id").n_unique()).filter(pl.col("n") > 1).height
-    print(f"accepted links {matches.height:,} | targets accepted by 2+ S1: {collisions:,} | total time {(time.time() - t_all) / 60:.1f} min")
+    print(f"final links {matches.height:,} | total time {(time.time() - t_all) / 60:.1f} min")
     (C.WORK_DIR / "test_inference_meta.json").write_text(json.dumps({
-        "threshold": thr, "model_sha256": frozen["model_sha256"], "candidates": scored.height, "matches": matches.height,
+        "threshold": thr, "model_sha256": frozen["model_sha256"], "candidates": scored.height,
+        "accepted": accepted.height, "matches_after_one_owner": matches.height,
         "targets_accepted_by_multiple_s1": collisions, "diagnostics": diag.to_dicts(),
     }, indent=2, default=float), encoding="utf-8")
     print("\nwritten:", cand_path, match_path, sep="\n  ")
