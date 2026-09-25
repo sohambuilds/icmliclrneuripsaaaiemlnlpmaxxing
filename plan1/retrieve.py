@@ -28,14 +28,43 @@ TOP_K = 50
 QUERY_BATCH = 20_000
 
 
+class TargetIndex:
+    """TF-IDF fitted on one (country, source) partition's target texts; returns top-k targets by cosine."""
+
+    def __init__(self, targets: pl.DataFrame):
+        self.ids = targets["entity_id"]
+        self.vec = TfidfVectorizer(**TFIDF_PARAMS)
+        self.by_term = self.vec.fit_transform(targets["retrieval_text"].to_list()).T.tocsr()  # vocabulary x targets
+
+    @property
+    def vocabulary_size(self) -> int:
+        return len(self.vec.vocabulary_)
+
+    def query(self, queries: pl.DataFrame, top_k: int = TOP_K, n_threads: int | None = None) -> pl.DataFrame:
+        """queries: entity_id, retrieval_text. Returns s1_id, target_id, score (positive scores only)."""
+        qm = self.vec.transform(queries["retrieval_text"].to_list())
+        res = sp_matmul_topn(qm, self.by_term, top_n=top_k, sort=True, n_threads=n_threads or os.cpu_count()).tocsr()
+        rows = np.repeat(np.arange(res.shape[0], dtype=np.uint32), np.diff(res.indptr))
+        return pl.DataFrame({
+            "s1_id": queries["entity_id"].gather(pl.Series(rows)),
+            "target_id": self.ids.gather(pl.Series(res.indices.astype(np.uint32))),
+            "score": pl.Series(res.data.astype(np.float32)),
+        }).filter(pl.col("score") > 0)
+
+
+def add_rank(cands: pl.DataFrame) -> pl.DataFrame:
+    """rank 1 = best within (s1_id, source); ties broken by target id."""
+    return cands.sort(["s1_id", "source", "score", "target_id"], descending=[False, False, True, False]).with_columns(
+        rank=(pl.int_range(pl.len()).over("s1_id", "source") + 1).cast(pl.Int32)
+    )
+
+
 def retrieve(norm: pl.DataFrame, query_ids: pl.Series, top_k: int = TOP_K, batch: int = QUERY_BATCH,
              n_threads: int | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """norm: normalized records of ONE split (S1 queries and S2/S3 targets).
 
-    Returns (candidates, timings). candidates: s1_id, target_id, source, country, score, rank (1 = best within
-    its source; ties broken by target id).
+    Returns (candidates, timings). candidates: s1_id, target_id, source, country, score, rank.
     """
-    n_threads = n_threads or os.cpu_count()
     queries = norm.filter(pl.col("source") == "S1").join(pl.DataFrame({"entity_id": query_ids}), on="entity_id", how="semi")
     parts, timings = [], []
     for country in sorted(queries["country"].unique().to_list()):
@@ -45,37 +74,18 @@ def retrieve(norm: pl.DataFrame, query_ids: pl.Series, top_k: int = TOP_K, batch
             if t.height == 0:
                 continue
             t0 = time.time()
-            vec = TfidfVectorizer(**TFIDF_PARAMS)
-            target_matrix = vec.fit_transform(t["retrieval_text"].to_list())
-            target_by_term = target_matrix.T.tocsr()  # vocabulary x targets
+            index = TargetIndex(t)
             build_s = time.time() - t0
-            target_ids = t["entity_id"]
             for start in range(0, q.height, batch):
                 qb = q.slice(start, batch)
                 t1 = time.time()
-                qm = vec.transform(qb["retrieval_text"].to_list())
-                res = sp_matmul_topn(qm, target_by_term, top_n=top_k, sort=True, n_threads=n_threads).tocsr()
-                rows = np.repeat(np.arange(res.shape[0], dtype=np.uint32), np.diff(res.indptr))
-                parts.append(
-                    pl.DataFrame({
-                        "s1_id": qb["entity_id"].gather(pl.Series(rows)),
-                        "target_id": target_ids.gather(pl.Series(res.indices.astype(np.uint32))),
-                        "score": pl.Series(res.data.astype(np.float32)),
-                    })
-                    .filter(pl.col("score") > 0)
-                    .with_columns(source=pl.lit(src), country=pl.lit(country))
-                )
-                timings.append({"country": country, "source": src, "targets": t.height, "vocabulary": len(vec.vocabulary_),
+                parts.append(index.query(qb, top_k, n_threads).with_columns(source=pl.lit(src), country=pl.lit(country)))
+                timings.append({"country": country, "source": src, "targets": t.height, "vocabulary": index.vocabulary_size,
                                 "batch_start": start, "queries": qb.height, "index_build_s": build_s if start == 0 else 0.0,
                                 "query_s": time.time() - t1})
-            print(f"  {country}/{src}: {t.height:,} targets, vocab {len(vec.vocabulary_):,}, {q.height:,} queries, "
+            print(f"  {country}/{src}: {t.height:,} targets, vocab {index.vocabulary_size:,}, {q.height:,} queries, "
                   f"build {build_s:.0f}s, query {sum(x['query_s'] for x in timings if x['country'] == country and x['source'] == src):.0f}s")
-    cands = (
-        pl.concat(parts)
-        .sort(["s1_id", "source", "score", "target_id"], descending=[False, False, True, False])
-        .with_columns(rank=(pl.int_range(pl.len()).over("s1_id", "source") + 1).cast(pl.Int32))
-    )
-    return cands, pl.DataFrame(timings)
+    return add_rank(pl.concat(parts)), pl.DataFrame(timings)
 
 
 def candidate_report(cands: pl.DataFrame, truth: pl.DataFrame, universe: pl.Series, norm: pl.DataFrame) -> dict:
