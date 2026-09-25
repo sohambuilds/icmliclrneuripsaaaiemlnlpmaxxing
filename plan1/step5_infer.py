@@ -17,7 +17,7 @@ import lightgbm as lgb
 import polars as pl
 
 from . import config as C
-from .dataio import read_id_lists, write_id_lists
+from .dataio import read_id_lists, test_s1_roster, write_id_lists
 from .decide import one_owner
 from .features import FEATURES, build_features, matrix, text_lookup
 from .normalize import NORMALIZE_VERSION
@@ -60,7 +60,8 @@ def main() -> None:
 
     norm = normalized("test")
     queries = norm.filter(pl.col("source") == "S1").sort("entity_id")
-    roster = queries["entity_id"]
+    roster = test_s1_roster()  # rows are written in test_source1.tsv order
+    assert set(roster.to_list()) == set(queries["entity_id"].to_list())
     CHUNK_DIR.mkdir(parents=True, exist_ok=True)
     # chunks hold model scores: never mix chunks from a different model or normalization
     chunk_meta = CHUNK_DIR / "chunk_meta.json"

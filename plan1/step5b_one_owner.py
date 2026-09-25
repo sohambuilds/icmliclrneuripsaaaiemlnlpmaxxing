@@ -9,7 +9,7 @@ import json
 import polars as pl
 
 from . import config as C
-from .dataio import load_records, write_id_lists
+from .dataio import load_records, test_s1_roster, write_id_lists
 from .decide import one_owner
 
 CHUNK_DIR = C.WORK_DIR / "test_chunks"
@@ -21,7 +21,7 @@ def main() -> None:
     thr = json.loads((C.WORK_DIR / "frozen_config.json").read_text(encoding="utf-8"))["threshold"]
     scored = pl.read_parquet(str(CHUNK_DIR / "*.parquet"))
     s1 = load_records("test").filter(pl.col("source") == "S1").select(s1_id="entity_id", country="country")
-    roster = s1["s1_id"].sort()
+    roster = test_s1_roster()  # rows are written in test_source1.tsv order
 
     accepted = scored.filter(pl.col("p") >= thr).join(s1, on="s1_id")
     ranked = accepted.sort(["target_id", "p", "s1_id"], descending=[False, True, False]).with_columns(

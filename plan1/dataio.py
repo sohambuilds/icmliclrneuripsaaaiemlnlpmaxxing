@@ -66,10 +66,16 @@ def label_roster() -> pl.DataFrame:
     return raw.select(s1_id="source1_entity_id")
 
 
-def write_id_lists(links: pl.DataFrame, roster: pl.Series, path, list_column: str) -> None:
-    """Write one row per S1 in `roster`: s1 id <TAB> comma-joined target ids (empty when none).
+def test_s1_roster() -> pl.Series:
+    """Test S1 ids in the exact row order of test_source1.tsv (the order submissions are written in)."""
+    return read_tsv(C.DATA_DIR / "test" / "test_source1.tsv", C.SOURCE_COLUMNS)["entity_id"]
 
-    links: (s1_id, target_id) rows; duplicates are removed, ids sorted for a stable file.
+
+def write_id_lists(links: pl.DataFrame, roster: pl.Series, path, list_column: str) -> None:
+    """Write one row per S1 in `roster`, in roster order: s1 id <TAB> comma-joined target ids (empty when none).
+
+    links: (s1_id, target_id) rows; duplicates are removed, ids inside a list sorted for a stable file.
+    Plain UTF-8, no BOM, no quoting, '\\n' line endings.
     """
     lists = (
         links.select("s1_id", "target_id").unique()
@@ -79,13 +85,15 @@ def write_id_lists(links: pl.DataFrame, roster: pl.Series, path, list_column: st
     )
     out = (
         pl.DataFrame({"source1_entity_id": roster})
-        .join(lists.rename({"s1_id": "source1_entity_id"}), on="source1_entity_id", how="left")
+        .join(lists.rename({"s1_id": "source1_entity_id"}), on="source1_entity_id", how="left", maintain_order="left")
         .with_columns(pl.col(list_column).fill_null(""))
     )
     if out["source1_entity_id"].n_unique() != out.height:
         raise ValueError("roster has duplicate S1 ids")
+    if not out["source1_entity_id"].equals(roster.rename("source1_entity_id")):
+        raise ValueError("row order differs from the roster")
     path.parent.mkdir(parents=True, exist_ok=True)
-    out.write_csv(path, separator="\t", quote_style="never")
+    out.write_csv(path, separator="\t", quote_style="never", line_terminator="\n", include_bom=False)
 
 
 def read_id_lists(path, list_column: str) -> pl.DataFrame:
