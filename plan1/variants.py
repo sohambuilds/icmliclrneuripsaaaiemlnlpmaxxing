@@ -9,6 +9,8 @@ Each variant goes to output/plan1/<run>[-s2]-<variant>/matching_results.tsv:
   france  the main answer for France S1 only, every other S1 empty: a leaderboard probe. Because the score is a
           mean over S1, (probe score - share of non-France S1 that truly have no match) / France share of S1
           estimates France's own score; the no-match share is unknown, ~5.6% in train.
+  usin85/90/95  US/India at a stricter threshold, France unchanged: does the test (more distractors) want a
+          stricter threshold than C-select?
   nofrance  the main answer with every France S1 empty: the better probe. (main - nofrance) / France share of S1
           = France's mean score - France's no-match share, so only the small France no-match share is guessed.
 Validate each with utils/validate_submission.py --matching <file> --test-dir dataset/test --check-ids
@@ -53,6 +55,10 @@ def main(stage: str) -> None:
         "france": base.join(s1c.filter(pl.col("country") == "France"), on="s1_id", how="semi"),
         "nofrance": base.join(s1c.filter(pl.col("country") == "France"), on="s1_id", how="anti"),
     }
+    fr_ids = s1c.filter(pl.col("country") == "France").select("s1_id")
+    for t in (0.85, 0.90, 0.95):  # stricter threshold for US/India only; France unchanged, so main - usinXX is pure US/India
+        us_in = scores.filter(pl.col("p") >= t).select("s1_id", "target_id", "p").join(fr_ids, on="s1_id", how="anti")
+        variants[f"usin{round(t * 100)}"] = one_owner(pl.concat([accepted.join(fr_ids, on="s1_id", how="semi"), us_in]))
     print(f"{stage}: threshold {thr}, main answer (one owner) {base.height:,} links")
     for name, links in variants.items():
         path = C.ROOT / "output" / "plan1" / f"{prefix}-{name}" / "matching_results.tsv"

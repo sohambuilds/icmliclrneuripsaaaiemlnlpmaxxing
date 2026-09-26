@@ -26,8 +26,7 @@ import polars as pl
 import torch
 
 from . import config as C
-from .enrich import FR_DOTTED, enriched
-from .normalize import DOTTED_FORMS, word_map
+from .enrich import enriched, joined_forms
 from .splits import stable_unit
 
 S2_DIR = C.WORK_DIR / "stage2_ce"
@@ -39,9 +38,7 @@ HOLDOUT_SALT = "amc26-ce-holdout-v1"
 # ---------------------------------------------------------------- text
 def record_text(norm: pl.DataFrame) -> pl.DataFrame:
     """entity_id, text for every record of an enriched split. S2/S3 texts start with their source."""
-    fr = pl.col("country") == "France"
-    name = word_map(pl.col("name_cons").fill_null(""), DOTTED_FORMS)
-    name = pl.when(fr).then(word_map(name, FR_DOTTED)).otherwise(name)
+    name = joined_forms(pl.col("name_cons"), pl.col("country") == "France")
     addr = pl.col("addr_norm").fill_null("")
     text = pl.when(addr != "").then(name + " ; " + addr).otherwise(name).str.slice(0, 200)
     text = pl.when(pl.col("source") == "S1").then(text).otherwise(pl.col("source").str.to_lowercase() + " " + text)

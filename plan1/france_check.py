@@ -34,8 +34,8 @@ def records() -> pl.DataFrame:
     norm = normalized("test").select("entity_id", "source", "country", "name_cons", "name_red")
     raw = load_records("test").select("entity_id", hn=first_number(pl.col("business_address")))
     fr = pl.col("country") == "France"
-    name = word_map(pl.col("name_cons"), DOTTED_FORMS)
-    name = pl.when(fr).then(word_map(name, FR_DOTTED)).otherwise(name)
+    name = word_map(pl.col("name_cons"), DOTTED_FORMS, leftmost=True)
+    name = pl.when(fr).then(word_map(name, FR_DOTTED, leftmost=True)).otherwise(name)
     forms = (name.str.split(" ")
              .list.eval(pl.element().replace_strict(list(FORMS), list(FORMS.values()), default=None, return_dtype=pl.String))
              .list.drop_nulls().list.unique().list.sort().list.join("+"))

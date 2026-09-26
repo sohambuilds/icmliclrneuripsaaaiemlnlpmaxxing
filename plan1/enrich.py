@@ -12,7 +12,8 @@
 Features v3 (French legal forms are told apart, and the addresses used by the pair features are cleaner):
   legal_bits  every French form is its own tag (SARL, SAS, SASU, EURL, SA, SCI, SNC, EI), only on French records;
               v2 had one "FR" tag, so a SARL -> SAS planted copy looked like an exact match
-  name_red    French records: S.A. / E.I. / EI dropped like the other legal forms
+  name_red    rebuilt with dotted forms joined longest-first (normalize v4 turned "S.A.S.U." into "sas u"); French
+              records also drop S.A. / E.I. / EI like the other legal forms
   addr_norm   number markers dropped ("no 12" -> "12"; French "n 12" too); French region and department names
               dropped (S1 always writes the region, S2/S3 a third of the time and often a department instead, and
               there are only 3 regions). Search keeps the step-2 text; only the pair features see these columns.
@@ -21,7 +22,8 @@ import polars as pl
 
 from . import config as C
 from .dataio import load_records
-from .normalize import DOTTED_FORMS, NORMALIZE_VERSION, _ws, word_map
+from .normalize import (DOTTED_FORMS, FUNCTION_WORDS, FUNCTION_WORDS_EXTRA, LEGAL_FORMS, LEGAL_FORMS_EXTRA,
+                        NORMALIZE_VERSION, _ws, word_map)
 
 FEATURES_VERSION = 3  # bump when enrich / build_features outputs change (feature caches carry it)
 
@@ -40,11 +42,20 @@ FR_PLACES = {k: "" for k in ("hauts de france", "nouvelle aquitaine", "pays de l
                              "gironde", "loire atlantique")}
 
 
+DROP_RE = r"\b(?:" + "|".join(LEGAL_FORMS + FUNCTION_WORDS + LEGAL_FORMS_EXTRA + FUNCTION_WORDS_EXTRA) + r")\b"  # = normalize v4
+
+
+def joined_forms(name_cons: pl.Expr, is_fr: pl.Expr) -> pl.Expr:
+    """Dotted legal forms joined: L.L.C. -> llc, S.A.S.U. -> sasu (longest key wins); French records also S.A. -> sa,
+    E.I. -> ei."""
+    name = word_map(name_cons.fill_null(""), DOTTED_FORMS, leftmost=True)
+    return pl.when(is_fr).then(word_map(name, FR_DOTTED, leftmost=True)).otherwise(name)
+
+
 def legal_bits(name_cons: pl.Expr, is_fr: pl.Expr) -> pl.Expr:
-    name = word_map(name_cons, DOTTED_FORMS)
-    name = pl.when(is_fr).then(word_map(name, FR_DOTTED)).otherwise(name)
-    tags = name.str.split(" ").list.eval(pl.element().replace_strict(list(LEGAL_TAGS), list(LEGAL_TAGS.values()), default=None,
-                                                                     return_dtype=pl.String)).list.drop_nulls().list.unique()
+    tags = joined_forms(name_cons, is_fr).str.split(" ").list.eval(
+        pl.element().replace_strict(list(LEGAL_TAGS), list(LEGAL_TAGS.values()), default=None, return_dtype=pl.String)
+    ).list.drop_nulls().list.unique()
     tags = pl.when(is_fr).then(tags).otherwise(tags.list.set_difference(pl.lit(FR_TAGS)))
     tags = pl.when(tags.list.contains("LTD")).then(tags).otherwise(tags.list.set_difference(pl.lit(["PUBLIC"])))
     bits = tags.list.eval(pl.element().replace_strict(list(TAG_BIT), list(TAG_BIT.values()), return_dtype=pl.UInt32)).list.sum()
@@ -52,12 +63,13 @@ def legal_bits(name_cons: pl.Expr, is_fr: pl.Expr) -> pl.Expr:
 
 
 def feature_text(df: pl.DataFrame) -> pl.DataFrame:
-    """Features v3 rewrites of name_red / addr_norm (see the module doc); df has country, name_red, addr_norm."""
+    """Features v3 rewrites of name_red / addr_norm (see the module doc); df has country, name_cons, addr_norm."""
     fr = pl.col("country") == "France"
-    red_fr = _ws(pl.col("name_red").str.replace_all(r"\b(?:ei|e i|s a)\b", " "))
+    red = _ws(joined_forms(pl.col("name_cons"), fr).str.replace_all(DROP_RE, " "))
+    red = pl.when(fr).then(_ws(red.str.replace_all(r"\bei\b", " "))).otherwise(red)
     addr = pl.col("addr_norm").fill_null("").str.replace_all(r"\bno (\d)", "${1}")
-    addr = pl.when(fr).then(_ws(word_map(addr, FR_PLACES).str.replace_all(r"\bn (\d)", "${1}"))).otherwise(addr)
-    return df.with_columns(name_red=pl.when(fr & (red_fr != "")).then(red_fr).otherwise(pl.col("name_red")),
+    addr = pl.when(fr).then(_ws(word_map(addr, FR_PLACES, leftmost=True).str.replace_all(r"\bn (\d)", "${1}"))).otherwise(addr)
+    return df.with_columns(name_red=pl.when(red != "").then(red).otherwise(pl.col("name_cons")),
                            addr_norm=addr).with_columns(addr_missing=pl.col("addr_norm") == "")
 
 

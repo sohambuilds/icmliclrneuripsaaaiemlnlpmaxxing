@@ -85,16 +85,18 @@ def basic_clean(e: pl.Expr) -> pl.Expr:
     return _ws(e)
 
 
-def word_map(e: pl.Expr, mapping: dict[str, str]) -> pl.Expr:
-    """Replace whole words/phrases in one pass (longest first).
+def word_map(e: pl.Expr, mapping: dict[str, str], leftmost: bool = False) -> pl.Expr:
+    """Replace whole words/phrases in one pass.
 
     The text's spaces are doubled so neighbouring matches don't share a separator; multi-word keys are doubled
-    the same way so they still match.
+    the same way so they still match. leftmost=True makes the longest key win when one key starts another
+    ("s a s u" over "s a s"). Without it Polars takes the match that ENDS first, so "S.A.S.U." became "sas u".
+    Normalize v4 (search text, cached) was built without it; features v3 pass leftmost=True.
     """
     keys = sorted(mapping, key=len, reverse=True)
     padded = " " + e.str.replace_all(" ", "  ") + " "
     patterns = [" " + k.replace(" ", "  ") + " " for k in keys]
-    return _ws(padded.str.replace_many(patterns, [f" {mapping[k]} " for k in keys]))
+    return _ws(padded.str.replace_many(patterns, [f" {mapping[k]} " for k in keys], leftmost=leftmost))
 
 
 def number_tokens(raw_address: pl.Expr, strip_markers: bool = True) -> pl.Expr:

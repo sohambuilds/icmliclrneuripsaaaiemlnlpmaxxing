@@ -16,7 +16,8 @@ models) from Fit-role training data only; same pipeline for train and test; subm
 | p1-v2 | Indic dictionary, states in one form, number markers, French/web words, 28 features, 300k Fit, one owner | 0.9523 | – | 0.9388 |
 | p1-v3 | + no-address name fallback search, 8000-round cap (stopped 4266), better dictionary, fresh panel | 0.9537 | 0.9531 | 0.9404 |
 | p1-v3-crowd10 | + drop records claimed by 10+ S1 | – | – | 0.940413 (no change) |
-| p1-v3-s2 | trap features (legal / house number / extra words / alias / frequency) + stage 2, XGBoost GPU | 0.9793 | 0.9794 | ? |
+| p1-v3-s2 | trap features (legal / house number / extra words / alias / frequency) + stage 2, XGBoost GPU | 0.9793 | 0.9794 | 0.952161 |
+| p1-v3-s2-nofrance | probe: France S1 empty | – | – | 0.830271 |
 | p1-v3-s2ce | features v3 (French legal forms apart) + cross-encoder feature + 2× stage-2 data | ? | ? | ? |
 
 Leaderboard ≈ panel − 1.3 to 1.4 (test has ~40% unmatched S2/S3 records vs 26% in train, plus France).
@@ -123,6 +124,21 @@ Calibrated (isotonic on C-select) + tuned alpha/gamma: dev 0.9791 vs 0.9793 glob
 - **Probe**: upload main + `nofrance` (France S1 empty). Then France score ≈ (main − nofrance)/0.1498 + ~0.056.
 - Diagnostic: `plan1/france_check.py` measures legal-form change tables on near-identical pairs and accepted France
   links that have a form change.
+
+### Leaderboard split of p1-v3-s2 (main 0.952161, nofrance 0.830271)
+- France ≈ (0.952161 − 0.830271)/0.1498 + 0.056 ≈ **0.87**. US/India on test ≈ **0.967**, but the panels said 0.979.
+- To reach 0.99 we need +1.8 pts from France and +2.0 from US/India. Both matter about equally.
+- US/India on test is 1.2 below the panels. The test differs from train (more distractors?), and our panels don't
+  show it. plan1/test_vs_dev.py compares the kinds of accepted/rejected links, test vs dev, and near-twin S1 rates.
+- france_check:
+  - 5.1% of France links (after one owner), touching 15% of France S1, change the legal form. Almost all of them
+    also shift the house number by 1–13 (e.g. "Atp Pharmacie SAS 3 Rue Pierre Milon" → "Atp Pharmacie SARL 5 Rue
+    Pierre Milon", p 0.9999). These are clear copies, and features v3 turns them into conflicts.
+  - On near-identical pairs, the model already rejects about half of the French form changes.
+- **Bug found**: Polars replace_many by default takes the match that ENDS first, so "S.A.S.U." → "sas u"
+  (SASU→SAS). france_check's 4,015 "SASU→SAS" rows were mostly true pairs.
+  - Fixed: word_map(leftmost=True) in features v3, the cross-encoder text and france_check.
+  - Normalize v4 (search text, cached) keeps the old behaviour.
 
 ### Leaderboard shape (2026-09-26)
 - Clusters: 0.957–0.958 and 0.965 ± 0.001. Then an even spread from 0.970 to 0.978, a jump to 0.98, and the top 3 all at 0.988.
