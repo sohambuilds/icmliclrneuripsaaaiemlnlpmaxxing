@@ -16,6 +16,7 @@ models) from Fit-role training data only; same pipeline for train and test; subm
 | p1-v2 | Indic dictionary, states in one form, number markers, French/web words, 28 features, 300k Fit, one owner | 0.9523 | – | 0.9388 |
 | p1-v3 | + no-address name fallback search, 8000-round cap (stopped 4266), better dictionary, fresh panel | 0.9537 | 0.9531 | 0.9404 |
 | p1-v3-crowd10 | + drop records claimed by 10+ S1 | – | – | 0.940413 (no change) |
+| p1-v3-s2 | trap features (legal / house number / extra words / alias / frequency) + stage 2, XGBoost GPU | 0.9793 | 0.9794 | ? |
 
 Leaderboard ≈ panel − 1.3 to 1.4 (test has ~40% unmatched S2/S3 records vs 26% in train, plus France).
 
@@ -76,4 +77,8 @@ candidates. 95% of no-match S1 have a similar wrong candidate (≈7.5 each) — 
 Added to stage 1 (both stages see them): legal category flags + per-side legal tags, house-number kind (equal,
 |difference|, digit edits, prefix/suffix), differing words (counts, short word, alias marker), alias / frequency
 (word counts, share of words unknown to S1 names, name/address frequency). Trained with XGBoost GPU.
-Result: (to fill)
+Result (p1-v3-s2): stage 1 alone dev 0.9777 / fresh 0.9780; **stage 2 dev 0.9793 / fresh 0.9794**, precision
+99.45%, recall 95.2%, no-match S1 given a link 1.2% (was 6.5%). Train and test pass ~20 min each on GPU.
+Leaderboard: (to fill)
+
+Rule from here: every model trains and predicts on the GPU.

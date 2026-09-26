@@ -1,8 +1,9 @@
 """Error breakdown on the DEVELOPMENT Audit panel (the first audit_panel). The fresh audit_panel_2 is not touched.
 
-Run from the repository root (needs steps 2-4 of the current run):  python -m plan1.error_analysis
-Outputs under work/plan1/<run>/error_analysis/: loss_split.tsv, rejected_true.tsv, accepted_wrong.tsv,
-rescue_rules.tsv, examples_*.tsv
+Run from the repository root:  python -m plan1.error_analysis
+Uses the second-stage models (plan1.stage2) when work/plan1/<run>/stage2/stage2_meta.json exists, else the
+first-stage model.txt. Outputs under work/plan1/<run>/error_analysis[_s2]/: loss_split.tsv, rejected_true.tsv,
+accepted_wrong.tsv, rescue_rules.tsv, examples_*.tsv
 
 1. Exact split of the lost score: wrong links on businesses with matches, true links the model rejects,
    true links search never found, no-match businesses given a link (the four parts add up to 1 - F0.5).
@@ -27,7 +28,8 @@ from .normalize import NORMALIZE_VERSION
 from .retrieve import TOP_K
 from .step3_train import labelled_features
 
-OUT = C.WORK_DIR / "error_analysis"
+S2_META = C.WORK_DIR / "stage2" / "stage2_meta.json"
+OUT = C.WORK_DIR / ("error_analysis_s2" if S2_META.exists() else "error_analysis")
 
 
 def macro(pred: pl.DataFrame, truth: pl.DataFrame, ids: pl.Series, countries: pl.DataFrame) -> dict:
@@ -54,9 +56,6 @@ def main() -> None:
     pl.Config.set_tbl_width_chars(250)
     pl.Config.set_fmt_str_lengths(55)
     OUT.mkdir(parents=True, exist_ok=True)
-    frozen = json.loads((C.WORK_DIR / "frozen_config.json").read_text(encoding="utf-8"))
-    thr = frozen["threshold"]
-    booster = lgb.Booster(model_file=str(C.WORK_DIR / "model.txt"))
     norm = enriched("train")
     cands = pl.read_parquet(C.WORK_DIR / "candidates_train.parquet")
     pairs = load_label_pairs()
@@ -66,7 +65,21 @@ def main() -> None:
     truth = pairs.join(pl.DataFrame({"s1_id": ids}), on="s1_id", how="semi")
 
     feats = labelled_features(cands.join(pl.DataFrame({"s1_id": ids}), on="s1_id", how="semi"), pairs, norm, "dev panel")
-    feats = feats.with_columns(p=pl.Series(booster.predict(matrix(feats))))
+    if S2_META.exists():
+        from .model import load_model, predict
+        from .stage2 import ALL_FEATURES, add_stage2_features, text_table
+
+        meta = json.loads(S2_META.read_text(encoding="utf-8"))
+        thr = meta["threshold"]
+        p1 = predict(load_model(meta["stage1_model"]), matrix(feats))
+        s2 = add_stage2_features(feats.with_columns(p1=pl.Series(p1)), text_table(norm, feats["target_id"]))
+        feats = feats.with_columns(p=pl.Series(predict(load_model(meta["stage2_model"]), matrix(s2, ALL_FEATURES))),
+                                   p1=pl.Series(p1))
+        print(f"second-stage models ({meta['backend']}), threshold {thr}")
+    else:
+        thr = json.loads((C.WORK_DIR / "frozen_config.json").read_text(encoding="utf-8"))["threshold"]
+        booster = lgb.Booster(model_file=str(C.WORK_DIR / "model.txt"))
+        feats = feats.with_columns(p=pl.Series(booster.predict(matrix(feats))))
     feats = feats.join(cands.select("s1_id", "target_id", "rank"), on=["s1_id", "target_id"], how="left")
     acc = feats.filter(pl.col("p") >= thr)
     n_true = truth.group_by("s1_id").agg(g=pl.len())
@@ -120,6 +133,12 @@ def main() -> None:
 
     website = pl.col("t_name").fill_null("").str.contains(r"(?i)www\.|\.(com|net|org|in|co|us|fr)\b")
     common = {
+        "legal forms conflict": pl.col("legal_conflict") == 1,
+        "only the record has a legal form": pl.col("legal_only_record") == 1,
+        "house number shifted by 1-10": (pl.col("hn_absdiff_log") > 0.6) & (pl.col("hn_absdiff_log") <= 2.4),
+        "house number otherwise different": (pl.col("hn_both") == 1) & (pl.col("hn_equal") == 0) & (pl.col("hn_absdiff_log") > 2.4),
+        "exactly one extra word": (pl.col("n_extra_t") + pl.col("n_extra_q")) == 1,
+        "invented name (no word known from S1 names)": pl.col("t_name_unknown_share") >= 0.99,
         "record has no address": pl.col("cand_addr_missing") == 1,
         "record name in Indian script": pl.col("cand_name_nonlatin") == 1,
         "record name is a website": website,
