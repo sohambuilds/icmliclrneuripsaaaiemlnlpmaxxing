@@ -82,3 +82,30 @@ Result (p1-v3-s2): stage 1 alone dev 0.9777 / fresh 0.9780; **stage 2 dev 0.9793
 Leaderboard: (to fill)
 
 Rule from here: every model trains and predicts on the GPU.
+
+### Where p1-v3-s2 still loses (dev panel 0.9793, threshold 0.741; work/plan1/p1-v3/error_analysis_s2/)
+| Loss | Points |
+| --- | ---: |
+| True links search found but the model rejects (2,578 = 3.8% of found) | 1.30 |
+| Wrong links on businesses with matches (344) | 0.36 |
+| Search never found the record | 0.34 |
+| No-match businesses given a link | 0.07 |
+
+- Rejected true links: **59% have no address** (vs 2.3% of accepted true) — by trap analysis these are ambiguous by
+  design (same-name address-less records of other businesses are true only ~4%); 27% had search rank > 10;
+  8.5% only found by the fallback; invented names 15%; one extra word 15%; weak name 18%. Half are close calls
+  (p 0.3–0.74), 23% confident rejects (aliases like "Dóvabrixorbi" with a matching address; "Paex Holdings"/"Paex LLC").
+- Wrong links: half other businesses' records, half no-business copies; invented names 20%, other number
+  differences 24%, weak names 23%, Indian-script 5%, websites 6%. Typical: "Great Diagnostics Inc" 301 vs 30 Poplar,
+  "Novan Limited" vs "Novana Limited", "FK Des" vs "FM Des" (one-letter name changes = copies too).
+- Simple "looks like an accepted record" rescue still hurts (adds ≥ as many wrong as right).
+
+## Next (ranked; goal 0.98+ on the leaderboard, 0.99 by day 3)
+1. **Per-business decision instead of one global threshold**: calibrate stage-2 scores (isotonic on C-select), then
+   for each S1 pick the set of candidates that maximises *expected* F0.5 (incl. the "nothing" option). No retraining;
+   minutes. Expected +0.1–0.3.
+2. **Learned (out-of-fold) tables** for trap words / legal-form swaps / one-letter name edits. Expected +0.1–0.2.
+3. **More training data**: all 1.32M Fit-role S1 instead of 300k (needs ~2 h CPU search, run in background).
+4. **Fine-tuned text cross-encoder on GPU** (multilingual MiniLM / XLM-R, MIT/Apache) as a stage-2 feature, for
+   one-letter edits, aliases, typos, Indian script. Biggest remaining lever, ~1 day.
+5. Search: deeper lists or a letter-group name+address channel for the 1.1% never found (0.34 pts).
