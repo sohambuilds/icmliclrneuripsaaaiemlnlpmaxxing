@@ -9,6 +9,7 @@ transformer).
   python -m plan1.stage2ce train    second stage with and without the cross-encoder; thresholds on C-select;
                                     dev + fresh panels
   python -m plan1.stage2ce test     step 5's test chunks -> output/plan1/<run>-s2ce/ and <run>-s2ce-noce/
+                                    (AMC_SHARD=i/n + CUDA_VISIBLE_DEVICES=i splits the chunks over GPUs)
 
 Sets:
   fit        300k; out-of-fold p1
@@ -22,6 +23,7 @@ The second stage trains on fit + gbm_extra. It only sees candidates with p1 >= S
 Run everything with AMC_BACKEND=xgboost.
 """
 import json
+import os
 import sys
 import time
 
@@ -158,27 +160,31 @@ def main_stage1() -> None:
     fit = stage1_features("fit", ids["fit"], pairs, norm)
     tune = stage1_features("tune", ids["tune"], pairs, norm)
     model_path, oof_path = S2_DIR / "stage1_full.xgb.json", S2_DIR / "p1_fit_oof.parquet"
-    if model_path.exists() and oof_path.exists():
-        stage1 = load_model(model_path)
-        print("first stage: reusing the saved model and out-of-fold scores")
-    else:
+    if not (model_path.exists() and oof_path.exists()):  # every piece is saved as soon as it exists (restartable)
         x_fit, y_fit = matrix(fit), fit["label"].to_numpy()
         x_tune, y_tune = matrix(tune), tune["label"].to_numpy()
-        stage1, secs = train_model(x_fit, y_fit, x_tune, y_tune, FEATURES, "xgboost")
-        print(f"first stage trained in {secs:.0f}s, best iteration {best_iteration(stage1)}")
+        if not model_path.exists():
+            m, secs = train_model(x_fit, y_fit, x_tune, y_tune, FEATURES, "xgboost")
+            save_model(m, S2_DIR / "stage1_full")
+            print(f"first stage trained in {secs:.0f}s, best iteration {best_iteration(m)}", flush=True)
         uniq = fit["s1_id"].unique()
         fold_of = pl.DataFrame({"s1_id": uniq, "fold": (stable_unit(uniq.to_list(), C.STAGE2_FOLD_SALT) * C.STAGE2_FOLDS).astype(np.int32)})
         fold = fit.select("s1_id").join(fold_of, on="s1_id", how="left", maintain_order="left")["fold"].to_numpy()
         p_oof = np.full(len(fold), np.nan, dtype=np.float32)
         for k in range(C.STAGE2_FOLDS):
+            part = S2_DIR / f"p1_fit_oof_fold{k}.npy"
             tr = fold != k
+            if part.exists():
+                p_oof[~tr] = np.load(part)
+                continue
             m, secs = train_model(x_fit[tr], y_fit[tr], x_tune, y_tune, FEATURES, "xgboost")
             p_oof[~tr] = predict(m, x_fit[~tr])
-            print(f"out-of-fold model {k + 1}/{C.STAGE2_FOLDS}: {secs:.0f}s, best iteration {best_iteration(m)}")
+            np.save(part, p_oof[~tr])
+            print(f"out-of-fold model {k + 1}/{C.STAGE2_FOLDS}: {secs:.0f}s, best iteration {best_iteration(m)}", flush=True)
         assert not np.isnan(p_oof).any()
         del x_fit, x_tune
-        save_model(stage1, S2_DIR / "stage1_full")
         fit.select("s1_id", "target_id").with_columns(p1=pl.Series(p_oof)).write_parquet(oof_path)
+    stage1 = load_model(model_path)
     fit = fit.join(pl.read_parquet(oof_path), on=["s1_id", "target_id"], how="left", maintain_order="left")
     assert fit["p1"].null_count() == 0
 
@@ -207,50 +213,62 @@ def main_stage1() -> None:
 
 
 # ---------------------------------------------------------------- stage 2
-def load_set(k: str, norm: pl.DataFrame) -> pl.DataFrame:
-    d = pl.read_parquet(S2_DIR / f"base_{k}.parquet").join(pl.read_parquet(S2_DIR / f"ce_{k}.parquet"),
-                                                           on=["s1_id", "target_id"], how="left", maintain_order="left")
-    assert d["ce"].null_count() == 0, f"{k}: cross-encoder scores missing (run: python -m plan1.cross_encoder score)"
-    return add_twin_features(add_ce_features(d), norm)
+def load_set(k: str, norm: pl.DataFrame, with_ce: bool = True) -> pl.DataFrame:
+    d = pl.read_parquet(S2_DIR / f"base_{k}.parquet")
+    if with_ce:
+        d = d.join(pl.read_parquet(S2_DIR / f"ce_{k}.parquet"), on=["s1_id", "target_id"], how="left", maintain_order="left")
+        assert d["ce"].null_count() == 0, f"{k}: cross-encoder scores missing (run: python -m plan1.cross_encoder score)"
+        d = add_ce_features(d)
+    return add_twin_features(d, norm)
 
 
-def main_train() -> None:
+def main_train(only: str = "") -> None:
+    """only='noce': train just the model without the cross-encoder (runs while the cross-encoder trains).
+    A saved stage2_<tag>.xgb.json is reused; delete it to retrain."""
     pl.Config.set_tbl_rows(40)
     pl.Config.set_tbl_width_chars(220)
     assert C.MODEL_BACKEND == "xgboost", "run with AMC_BACKEND=xgboost (everything on the GPU)"
+    tags = ("noce",) if only == "noce" else ("noce", "ce")
     pairs = load_label_pairs()
     countries = pl.read_parquet(C.SPLIT_DIR / "manifest.parquet").select("s1_id", "country")
     ids = set_ids()
     truth = {k: pairs.join(pl.DataFrame({"s1_id": ids[k]}), on="s1_id", how="semi") for k in ("c_select", "dev", "fresh")}
     norm = enriched("train")
-    d = {k: load_set(k, norm) for k in ("fit", "gbm_extra", "tune", "c_select", "dev", "fresh")}
+    d = {k: load_set(k, norm, with_ce="ce" in tags) for k in ("fit", "gbm_extra", "tune", "c_select", "dev", "fresh")}
     del norm
     train = pl.concat([d.pop("fit"), d.pop("gbm_extra")], how="vertical_relaxed")
     y_tr, y_tune = train["label"].to_numpy(), d["tune"]["label"].to_numpy()
     print(f"second-stage training rows {train.height:,} ({y_tr.mean():.3f} positive), tune rows {d['tune'].height:,}")
 
     rows, saved = [], {}
-    for tag in ("noce", "ce"):
+    for tag in tags:
         feats = FEATS[tag]
-        m, secs = train_model(matrix(train, feats), y_tr, matrix(d["tune"], feats), y_tune, feats, "xgboost")
+        path = S2_DIR / f"stage2_{tag}.xgb.json"
+        if path.exists():
+            m = load_model(path)
+            print(f"{tag}: reusing {path.name}")
+        else:
+            m, secs = train_model(matrix(train, feats), y_tr, matrix(d["tune"], feats), y_tune, feats, "xgboost")
+            path = save_model(m, S2_DIR / f"stage2_{tag}")
+            print(f"{tag}: trained in {secs:.0f}s, best iteration {best_iteration(m)}")
         pred = {k: d[k].select("s1_id", "target_id", "label").with_columns(p=pl.Series(predict(m, matrix(d[k], feats))))
                 for k in ("c_select", "dev", "fresh")}
         for k, v in pred.items():  # kept for plan1.density_fix
             v.write_parquet(S2_DIR / f"pred_{tag}_{k}.parquet")
         best = choose_threshold(pred["c_select"], truth["c_select"], ids["c_select"])
         thr = best["threshold"]
-        print(f"{tag}: trained in {secs:.0f}s, best iteration {best_iteration(m)}, threshold {thr} -> C-select F0.5 {best['macro_f05']:.4f}")
+        print(f"{tag}: threshold {thr} -> C-select F0.5 {best['macro_f05']:.4f}")
         for k in ("dev", "fresh"):
             rows.append({"panel": k, "model": tag, **panel_scores(pred[k].filter(pl.col("p") >= thr), truth[k], ids[k], countries)})
-        path = save_model(m, S2_DIR / f"stage2_{tag}")
         saved[tag] = {"model": str(path), "features": feats, "threshold": thr, "c_select_f05": best["macro_f05"]}
-        if tag == "ce":
-            imp = importance(m, feats)
-            print(pl.DataFrame({"feature": list(imp), "gain": list(imp.values())})
-                  .with_columns(share=pl.col("gain") / pl.col("gain").sum()).sort("gain", descending=True).head(25))
+        imp = importance(m, feats)
+        print(pl.DataFrame({"feature": list(imp), "gain": list(imp.values())})
+              .with_columns(share=pl.col("gain") / pl.col("gain").sum()).sort("gain", descending=True).head(25))
     report = pl.DataFrame(rows)
-    print("\nno cross-encoder vs cross-encoder (p1-v3-s2 was dev 0.9793 / fresh 0.9794):")
+    print("\npanels (p1-v3-s2 was dev 0.9793 / fresh 0.9794):")
     print(report)
+    if only == "noce":
+        return
     (S2_DIR / "stage2ce_meta.json").write_text(json.dumps({
         "stage1_model": str(S2_DIR / "stage1_full.xgb.json"), "ce_dir": str(CE_DIR), **saved,
         "min_p1": C.S2_MIN_P1, "top": C.S2_TOP, "features_version": FEATURES_VERSION,
@@ -272,8 +290,10 @@ def main_test() -> None:
     norm = enriched("test")
     texts = record_text(norm)
     TEST_DIR.mkdir(parents=True, exist_ok=True)
+    shard = os.environ.get("AMC_SHARD")  # "i/n": this process scores chunks i, i+n, ... (one process per GPU)
+    mine = [f for j, f in enumerate(files) if j % int(shard.split("/")[1]) == int(shard.split("/")[0])] if shard else files
     t_all = time.time()
-    for i, f in enumerate(files, 1):
+    for i, f in enumerate(mine, 1):
         out_path = TEST_DIR / f.name
         if out_path.exists():
             continue
@@ -295,10 +315,13 @@ def main_test() -> None:
         tmp = out_path.with_suffix(".tmp")
         res.write_parquet(tmp)
         tmp.replace(out_path)
-        print(f"  {i}/{len(files)} {f.name}: {c.height:,} candidates, {res.height:,} kept, "
+        print(f"  {i}/{len(mine)} {f.name}: {c.height:,} candidates, {res.height:,} kept, "
               f"{int((res['p'] >= meta['ce']['threshold']).sum()):,} accepted, {time.time() - t1:.0f}s "
               f"(elapsed {(time.time() - t_all) / 60:.1f} min)", flush=True)
 
+    if not all((TEST_DIR / f.name).exists() for f in files):
+        print("this shard is done; when every shard has finished, run once more without AMC_SHARD to write the outputs")
+        return
     scores = pl.read_parquet(str(TEST_DIR / "*.parquet"))
     cands = pl.read_parquet(str(C.WORK_DIR / "test_chunks" / "*.parquet"), columns=["s1_id", "target_id"])
     roster = test_s1_roster()
@@ -322,5 +345,5 @@ def main_test() -> None:
 if __name__ == "__main__":
     cmds = {"stage1": main_stage1, "train": main_train, "test": main_test}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
-        raise SystemExit("usage: python -m plan1.stage2ce stage1 | train | test")
-    cmds[sys.argv[1]]()
+        raise SystemExit("usage: python -m plan1.stage2ce stage1 | train [noce] | test")
+    cmds[sys.argv[1]](*sys.argv[2:3])
