@@ -34,8 +34,12 @@ def main(stage: str) -> None:
         scores = pl.read_parquet(str(C.WORK_DIR / "stage2" / "test_scores" / "*.parquet"))
         thr = json.loads((C.WORK_DIR / "stage2" / "stage2_meta.json").read_text(encoding="utf-8"))["threshold"]
         prefix = f"{C.RUN_ID}-s2"
+    elif stage == "s2ce":
+        scores = pl.read_parquet(str(C.WORK_DIR / "stage2_ce" / "test_scores" / "*.parquet"), columns=["s1_id", "target_id", "p"])
+        thr = json.loads((C.WORK_DIR / "stage2_ce" / "stage2ce_meta.json").read_text(encoding="utf-8"))["ce"]["threshold"]
+        prefix = f"{C.RUN_ID}-s2ce"
     else:
-        raise SystemExit("usage: python -m plan1.variants stage1 | stage2")
+        raise SystemExit("usage: python -m plan1.variants stage1 | stage2 | s2ce")
     roster = test_s1_roster()
     s1c = load_records("test").filter(pl.col("source") == "S1").select(s1_id="entity_id", country="country")
     accepted = scores.filter(pl.col("p") >= thr).select("s1_id", "target_id", "p")

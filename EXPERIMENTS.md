@@ -19,7 +19,8 @@ models) from Fit-role training data only; same pipeline for train and test; subm
 | p1-v3-s2 | trap features (legal / house number / extra words / alias / frequency) + stage 2, XGBoost GPU | 0.9793 | 0.9794 | 0.952161 |
 | p1-v3-s2-nofrance | probe: France S1 empty | – | – | 0.830271 |
 | p1-v3-s2-usin90 | US/India threshold 0.90 (France unchanged) | – | – | 0.953304 (+0.00114) |
-| p1-v3-s2ce | features v3 (French legal forms apart) + cross-encoder feature + 2× stage-2 data | ? | ? | ? |
+| p1-v3-s2ce-noce | features v3 + twin features + 2× stage-2 data (no cross-encoder) | 0.9802 | 0.9802 | ? |
+| p1-v3-s2ce | + cross-encoder (MiniLM-L12, held-out AUC 0.9971 vs stage 1 0.9962 on the same pairs) | **0.9854** | **0.9860** | ? |
 
 Leaderboard ≈ panel − 1.3 to 1.4 (test has ~40% unmatched S2/S3 records vs 26% in train, plus France).
 
@@ -172,6 +173,19 @@ Calibrated (isotonic on C-select) + tuned alpha/gamma: dev 0.9791 vs 0.9793 glob
   - A copy sits next to the real record, and this signal does not depend on how many copies exist, so it should
     carry over to the copy-heavy test.
 - density_fix works for both p1-v3-s2 (stage2) and s2ce (uses the saved pred_ce_dev.parquet).
+
+### p1-v3-s2ce results (panels)
+- Stage 1 (features v3, XGBoost GPU): 5,936 rounds, about 1 s per round, 103 min. The p1 ≥ 1e-3 floor keeps 6.7
+  candidates per S1 and 99.95% of the true links search found.
+- **Cross-encoder:**
+  - Training: 2.0M pairs (51% true), 15 min on one A6000.
+  - Held-out AUC 0.9971 alone, against 0.9962 for stage 1 on the same pairs.
+  - Scoring runs at 13.5k pairs/s.
+- **Stage 2 without the cross-encoder** (188 s): dev 0.9802 / fresh 0.9802, precision 99.4%, recall 95.6%,
+  no-match S1 given a link 0.99%.
+- **Stage 2 with the cross-encoder** (229 s, threshold 0.736): dev 0.98537 / fresh 0.98596, precision 99.72–99.75%,
+  recall 96.3%, no-match S1 given a link 0.27–0.54%.
+  - The cross-encoder carries 5.3% of the gain, second only to p1.
 
 ### Leaderboard shape (2026-09-26)
 - Clusters: 0.957–0.958 and 0.965 ± 0.001. Then an even spread from 0.970 to 0.978, a jump to 0.98, and the top 3 all at 0.988.
