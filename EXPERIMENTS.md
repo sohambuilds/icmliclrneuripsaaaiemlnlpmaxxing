@@ -18,6 +18,7 @@ models) from Fit-role training data only; same pipeline for train and test; subm
 | p1-v3-crowd10 | + drop records claimed by 10+ S1 | – | – | 0.940413 (no change) |
 | p1-v3-s2 | trap features (legal / house number / extra words / alias / frequency) + stage 2, XGBoost GPU | 0.9793 | 0.9794 | 0.952161 |
 | p1-v3-s2-nofrance | probe: France S1 empty | – | – | 0.830271 |
+| p1-v3-s2-usin90 | US/India threshold 0.90 (France unchanged) | – | – | 0.953304 (+0.00114) |
 | p1-v3-s2ce | features v3 (French legal forms apart) + cross-encoder feature + 2× stage-2 data | ? | ? | ? |
 
 Leaderboard ≈ panel − 1.3 to 1.4 (test has ~40% unmatched S2/S3 records vs 26% in train, plus France).
@@ -139,6 +140,38 @@ Calibrated (isotonic on C-select) + tuned alpha/gamma: dev 0.9791 vs 0.9793 glob
   (SASU→SAS). france_check's 4,015 "SASU→SAS" rows were mostly true pairs.
   - Fixed: word_map(leftmost=True) in features v3, the cross-encoder text and france_check.
   - Normalize v4 (search text, cached) keeps the old behaviour.
+
+### test_vs_dev (p1-v3-s2; kinds = name same/edit/extra_word/other × address kind × legal conflict)
+- For US/India, the precision of each kind looks like dev (expected wrong per 100 S1: US 1.68 vs 1.56, India 2.04
+  vs 1.96), and the empty rate is the same.
+- **But the test has many more near-copies per S1.** Plausible candidates per 100 S1 (p ≥ 0.02):
+
+  | Kind (US) | Test | Dev |
+  | --- | ---: | ---: |
+  | same name + street, number shifted ≤ 10 | 13.9 | 4.0 |
+  | extra word + number shifted | 10.2 | 0.7 |
+  | same name, other number | 23.1 | 18.2 |
+
+  India has more of the extra-word kinds (7.5 vs 1.0 per 100).
+- The model accepts +5.5 links per 100 S1 on test vs dev (3.38 vs 3.32 per S1), and true density should be equal,
+  so these are mostly copies. That accounts for about 1 pt of the US/India gap: the model is calibrated on train's
+  lower copy density.
+- **France:** accepted legal-swap copies ≈ 12.6 per 100 S1 (fixed in v3). France has 0.5% S1 "twins" (same name and
+  street, number shifted ≤ 10); train has ≈ 0%.
+- **Probes:** usin90 = US/India threshold 0.90, France unchanged. density_fix.py = per-kind prior correction
+  p/(p + (1 − p)·rho_k), with rho_k = the test/dev ratio of false pairs of that kind (US/India only).
+
+### usin90 = 0.953304 (+0.00114 on the leaderboard = +0.13 pts on US/India)
+- The stricter threshold drops 148k US/India links. Roughly 1/3 were wrong and 2/3 true, so the net gain is small.
+  Calibration alone is not the fix; the copies must be recognised.
+- **Twin features** (stage2ce, stage 2). Twins of a candidate = likely records (p1 ≥ 0.5) with a near-identical name
+  and street.
+  - twin_num_better: a twin has the S1's house number and this candidate does not.
+  - twin_leaner: a twin has the same words minus some.
+  - Also twin_same_num, twin_n, twin_p_max.
+  - A copy sits next to the real record, and this signal does not depend on how many copies exist, so it should
+    carry over to the copy-heavy test.
+- density_fix works for both p1-v3-s2 (stage2) and s2ce (uses the saved pred_ce_dev.parquet).
 
 ### Leaderboard shape (2026-09-26)
 - Clusters: 0.957–0.958 and 0.965 ± 0.001. Then an even spread from 0.970 to 0.978, a jump to 0.98, and the top 3 all at 0.988.

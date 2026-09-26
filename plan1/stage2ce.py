@@ -27,6 +27,7 @@ import time
 
 import numpy as np
 import polars as pl
+from rapidfuzz import fuzz, process
 
 from . import config as C
 from .cross_encoder import CE_DIR, S2_DIR, load as load_ce, pair_texts, record_text, score as ce_score
@@ -45,7 +46,8 @@ TEST_DIR = S2_DIR / "test_scores"
 OUT = {"ce": C.ROOT / "output" / "plan1" / f"{C.RUN_ID}-s2ce", "noce": C.ROOT / "output" / "plan1" / f"{C.RUN_ID}-s2ce-noce"}
 F32 = pl.Float32
 CE_FEATURES = ["ce", "ce_rank", "ce_rank_src", "ce_max", "ce_second", "ce_gap", "ce_n_pos", "ce_max_other_src"]
-FEATS = {"noce": FEATURES + STAGE2_FEATURES, "ce": FEATURES + STAGE2_FEATURES + CE_FEATURES}
+TWIN_FEATURES = ["twin_n", "twin_num_better", "twin_leaner", "twin_same_num", "twin_p_max"]
+FEATS = {"noce": FEATURES + STAGE2_FEATURES + TWIN_FEATURES, "ce": FEATURES + STAGE2_FEATURES + TWIN_FEATURES + CE_FEATURES}
 SETS = ("fit", "gbm_extra", "ce_train", "tune", "c_select", "dev", "fresh")
 
 
@@ -104,6 +106,42 @@ def add_ce_features(df: pl.DataFrame) -> pl.DataFrame:
     other = (out.group_by("s1_id", "source").agg(ce_max_other_src=c.max().cast(F32))
              .with_columns(source=pl.when(pl.col("source") == "S2").then(pl.lit("S3")).otherwise(pl.lit("S2"))))
     return out.join(other, on=["s1_id", "source"], how="left", maintain_order="left")
+
+
+def add_twin_features(df: pl.DataFrame, norm: pl.DataFrame) -> pl.DataFrame:
+    """Twins of a candidate: the S1's likely records (p1 >= STAGE2_ANCHOR_P) whose name (token set >= 0.9) and street
+    (address without numbers, token set >= 0.9, or neither has an address) are near-identical to it. A planted copy
+    sits next to the real record and differs in the number or adds a word. Whether a better twin exists does not
+    depend on how many copies there are, and the test has several times more copies than train.
+      twin_num_better  a twin has the S1's house number and this candidate does not
+      twin_leaner      a twin has this candidate's name words minus some (this candidate adds words)
+      twin_same_num    twins with this candidate's number (duplicates within a source)
+      twin_n, twin_p_max
+    """
+    street = pl.col("addr_norm").fill_null("").str.replace_all(r"\S*\d\S*", " ").str.replace_all(r"\s+", " ").str.strip_chars()
+    txt = (norm.join(pl.DataFrame({"entity_id": pl.concat([df["s1_id"], df["target_id"]]).unique()}), on="entity_id", how="semi")
+           .select("entity_id", nm="name_red", st=street, hn="hn", nt="name_ntok"))
+    anchors = df.filter(pl.col("p1") >= C.STAGE2_ANCHOR_P).select("s1_id", tw_id="target_id", tw_p="p1")
+    pr = (df.select("s1_id", "target_id").join(anchors, on="s1_id").filter(pl.col("target_id") != pl.col("tw_id"))
+          .join(txt.select(target_id="entity_id", t_nm="nm", t_st="st", t_hn="hn", t_nt="nt"), on="target_id")
+          .join(txt.select(tw_id="entity_id", w_nm="nm", w_st="st", w_hn="hn", w_nt="nt"), on="tw_id")
+          .join(txt.select(s1_id="entity_id", q_hn="hn"), on="s1_id", how="left"))
+    out = pl.DataFrame(schema={"s1_id": pl.String, "target_id": pl.String, **{f: F32 for f in TWIN_FEATURES}})
+    if pr.height:
+        ns = process.cpdist(pr["t_nm"].to_list(), pr["w_nm"].to_list(), scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
+        ss = process.cpdist(pr["t_st"].to_list(), pr["w_st"].to_list(), scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
+        street_ok = (((pl.col("ss") >= 0.9) & (pl.col("t_st") != "") & (pl.col("w_st") != ""))
+                     | ((pl.col("t_st") == "") & (pl.col("w_st") == "")))
+        pr = pr.with_columns(ns=pl.Series(ns), ss=pl.Series(ss)).filter((pl.col("ns") >= 0.9) & street_ok)
+        out = pr.group_by("s1_id", "target_id").agg(
+            twin_n=pl.len().cast(F32),
+            twin_num_better=((pl.col("w_hn") == pl.col("q_hn")) & (pl.col("t_hn") != pl.col("q_hn"))).fill_null(False).any().cast(F32),
+            twin_leaner=((pl.col("ns") >= 0.999) & (pl.col("w_nt") < pl.col("t_nt"))).fill_null(False).any().cast(F32),
+            twin_same_num=(pl.col("w_hn") == pl.col("t_hn")).fill_null(False).sum().cast(F32),
+            twin_p_max=pl.col("tw_p").max().cast(F32),
+        )
+    return (df.join(out, on=["s1_id", "target_id"], how="left", maintain_order="left")
+            .with_columns(pl.col("twin_n", "twin_num_better", "twin_leaner", "twin_same_num").fill_null(0)))
 
 
 # ---------------------------------------------------------------- stage 1
@@ -169,11 +207,11 @@ def main_stage1() -> None:
 
 
 # ---------------------------------------------------------------- stage 2
-def load_set(k: str) -> pl.DataFrame:
+def load_set(k: str, norm: pl.DataFrame) -> pl.DataFrame:
     d = pl.read_parquet(S2_DIR / f"base_{k}.parquet").join(pl.read_parquet(S2_DIR / f"ce_{k}.parquet"),
                                                            on=["s1_id", "target_id"], how="left", maintain_order="left")
     assert d["ce"].null_count() == 0, f"{k}: cross-encoder scores missing (run: python -m plan1.cross_encoder score)"
-    return add_ce_features(d)
+    return add_twin_features(add_ce_features(d), norm)
 
 
 def main_train() -> None:
@@ -184,7 +222,9 @@ def main_train() -> None:
     countries = pl.read_parquet(C.SPLIT_DIR / "manifest.parquet").select("s1_id", "country")
     ids = set_ids()
     truth = {k: pairs.join(pl.DataFrame({"s1_id": ids[k]}), on="s1_id", how="semi") for k in ("c_select", "dev", "fresh")}
-    d = {k: load_set(k) for k in ("fit", "gbm_extra", "tune", "c_select", "dev", "fresh")}
+    norm = enriched("train")
+    d = {k: load_set(k, norm) for k in ("fit", "gbm_extra", "tune", "c_select", "dev", "fresh")}
+    del norm
     train = pl.concat([d.pop("fit"), d.pop("gbm_extra")], how="vertical_relaxed")
     y_tr, y_tune = train["label"].to_numpy(), d["tune"]["label"].to_numpy()
     print(f"second-stage training rows {train.height:,} ({y_tr.mean():.3f} positive), tune rows {d['tune'].height:,}")
@@ -193,8 +233,10 @@ def main_train() -> None:
     for tag in ("noce", "ce"):
         feats = FEATS[tag]
         m, secs = train_model(matrix(train, feats), y_tr, matrix(d["tune"], feats), y_tune, feats, "xgboost")
-        pred = {k: d[k].select("s1_id", "target_id").with_columns(p=pl.Series(predict(m, matrix(d[k], feats))))
+        pred = {k: d[k].select("s1_id", "target_id", "label").with_columns(p=pl.Series(predict(m, matrix(d[k], feats))))
                 for k in ("c_select", "dev", "fresh")}
+        for k, v in pred.items():  # kept for plan1.density_fix
+            v.write_parquet(S2_DIR / f"pred_{tag}_{k}.parquet")
         best = choose_threshold(pred["c_select"], truth["c_select"], ids["c_select"])
         thr = best["threshold"]
         print(f"{tag}: trained in {secs:.0f}s, best iteration {best_iteration(m)}, threshold {thr} -> C-select F0.5 {best['macro_f05']:.4f}")
@@ -244,6 +286,7 @@ def main_test() -> None:
             feats = feats.with_columns(p1=pl.Series(predict(stage1, matrix(feats)), dtype=F32))
             kept = keep(add_stage2_features(feats, text_table(norm, feats["target_id"])))
             if kept.height:
+                kept = add_twin_features(kept, norm)
                 a, b = pair_texts(kept, texts)
                 kept = add_ce_features(kept.with_columns(ce=pl.Series(ce_score(tok, ce_model, a, b), dtype=F32)))
                 res = kept.select("s1_id", "target_id", "source", "p1", "ce").with_columns(
