@@ -20,7 +20,8 @@ models) from Fit-role training data only; same pipeline for train and test; subm
 | p1-v3-s2-nofrance | probe: France S1 empty | – | – | 0.830271 |
 | p1-v3-s2-usin90 | US/India threshold 0.90 (France unchanged) | – | – | 0.953304 (+0.00114) |
 | p1-v3-s2ce-noce | features v3 + twin features + 2× stage-2 data (no cross-encoder) | 0.9802 | 0.9802 | ? |
-| p1-v3-s2ce | + cross-encoder (MiniLM-L12, held-out AUC 0.9971 vs stage 1 0.9962 on the same pairs) | **0.9854** | **0.9860** | ? |
+| p1-v3-s2ce | + cross-encoder (MiniLM-L12, held-out AUC 0.9971 vs stage 1 0.9962 on the same pairs) | **0.9854** | **0.9860** | **0.975228** |
+| p1-v3-s2ce-nofrance | probe | – | – | 0.845536 |
 
 Leaderboard ≈ panel − 1.3 to 1.4 (test has ~40% unmatched S2/S3 records vs 26% in train, plus France).
 
@@ -173,6 +174,13 @@ Calibrated (isotonic on C-select) + tuned alpha/gamma: dev 0.9791 vs 0.9793 glob
   - A copy sits next to the real record, and this signal does not depend on how many copies exist, so it should
     carry over to the copy-heavy test.
 - density_fix works for both p1-v3-s2 (stage2) and s2ce (uses the saved pred_ce_dev.parquet).
+
+### p1-v3-s2ce on the leaderboard: 0.975228 (was 0.952161)
+- Split with nofrance: US/India on test ≈ **0.985** (panels 0.9854/0.9860). The panel→test gap for US/India fell
+  from 1.2 pts to 0.1 thanks to the twin features and the cross-encoder.
+- France ≈ **0.922** (was 0.870).
+- Leaderboard value of one point: France +1 pt = +0.15; US/India +1 pt = +0.85. Reaching 0.988 needs roughly
+  France 0.98 and US/India 0.988–0.99.
 
 ### p1-v3-s2ce results (panels)
 - Stage 1 (features v3, XGBoost GPU): 5,936 rounds, about 1 s per round, 103 min. The p1 ≥ 1e-3 floor keeps 6.7
