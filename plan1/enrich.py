@@ -6,32 +6,59 @@
   name_unknown_share  share of the reduced name's words never used in any S1 name of the split (invented aliases)
   q_name_s1_rate      S1 rows: how common the name is among S1 of the country (per 100k)
   t_name_rate / t_addr_rate   S2/S3 rows: how common the name / address is among S2+S3 of the country (per 100k)
+  raw_name / raw_addr  the text exactly as read (v3: planted copies get re-formatted, some true records keep the
+                       S1's exact address)
+
+Features v3 (French legal forms are told apart, and the addresses used by the pair features are cleaner):
+  legal_bits  every French form is its own tag (SARL, SAS, SASU, EURL, SA, SCI, SNC, EI), only on French records;
+              v2 had one "FR" tag, so a SARL -> SAS planted copy looked like an exact match
+  name_red    French records: S.A. / E.I. / EI dropped like the other legal forms
+  addr_norm   number markers dropped ("no 12" -> "12"; French "n 12" too); French region and department names
+              dropped (S1 always writes the region, S2/S3 a third of the time and often a department instead, and
+              there are only 3 regions). Search keeps the step-2 text; only the pair features see these columns.
 """
 import polars as pl
 
 from . import config as C
 from .dataio import load_records
-from .normalize import DOTTED_FORMS, NORMALIZE_VERSION, word_map
+from .normalize import DOTTED_FORMS, NORMALIZE_VERSION, _ws, word_map
 
-FEATURES_VERSION = 2  # bump when enrich / build_features outputs change (feature caches carry it)
+FEATURES_VERSION = 3  # bump when enrich / build_features outputs change (feature caches carry it)
 
+FR_TAGS = ["SARL", "SAS", "SASU", "EURL", "SA", "SCI", "SNC", "EI"]
 LEGAL_TAGS = {
     "inc": "INC", "incorporated": "INC", "corp": "CORP", "corporation": "CORP", "co": "CO", "company": "CO",
     "llc": "LLC", "pllc": "PLLC", "llp": "LLP", "lp": "LP", "pc": "PC", "pa": "PA", "ltd": "LTD", "limited": "LTD",
-    "pvt": "PVT", "private": "PVT", "plc": "PLC", "opc": "OPC", "public": "PUBLIC", "sarl": "FR", "sas": "FR",
-    "sasu": "FR", "eurl": "FR", "sa": "FR", "sci": "FR", "snc": "FR",
+    "pvt": "PVT", "private": "PVT", "plc": "PLC", "opc": "OPC", "public": "PUBLIC",
+    **{t.lower(): t for t in FR_TAGS},
 }
-TAG_ORDER = ["INC", "CORP", "CO", "LLC", "PLLC", "LLP", "LP", "PC", "PA", "LTD", "PVT", "PLC", "OPC", "PUBLIC", "FR"]
+TAG_ORDER = ["INC", "CORP", "CO", "LLC", "PLLC", "LLP", "LP", "PC", "PA", "LTD", "PVT", "PLC", "OPC", "PUBLIC"] + FR_TAGS
 TAG_BIT = {t: 1 << i for i, t in enumerate(TAG_ORDER)}
+TAG_MASK = {**TAG_BIT, "FR": sum(TAG_BIT[t] for t in FR_TAGS)}  # the per-side flag "FR" = any French form
+FR_DOTTED = {"s a": "sa", "e i": "ei"}  # S.A. / E.I.: French records only (elsewhere usually initials)
+FR_PLACES = {k: "" for k in ("hauts de france", "nouvelle aquitaine", "pays de la loire", "nord", "pas de calais",
+                             "gironde", "loire atlantique")}
 
 
-def legal_bits(name_cons: pl.Expr) -> pl.Expr:
-    toks = word_map(name_cons, DOTTED_FORMS).str.split(" ")
-    tags = toks.list.eval(pl.element().replace_strict(list(LEGAL_TAGS), list(LEGAL_TAGS.values()), default=None,
-                                                      return_dtype=pl.String)).list.drop_nulls().list.unique()
+def legal_bits(name_cons: pl.Expr, is_fr: pl.Expr) -> pl.Expr:
+    name = word_map(name_cons, DOTTED_FORMS)
+    name = pl.when(is_fr).then(word_map(name, FR_DOTTED)).otherwise(name)
+    tags = name.str.split(" ").list.eval(pl.element().replace_strict(list(LEGAL_TAGS), list(LEGAL_TAGS.values()), default=None,
+                                                                     return_dtype=pl.String)).list.drop_nulls().list.unique()
+    tags = pl.when(is_fr).then(tags).otherwise(tags.list.set_difference(pl.lit(FR_TAGS)))
     tags = pl.when(tags.list.contains("LTD")).then(tags).otherwise(tags.list.set_difference(pl.lit(["PUBLIC"])))
     bits = tags.list.eval(pl.element().replace_strict(list(TAG_BIT), list(TAG_BIT.values()), return_dtype=pl.UInt32)).list.sum()
     return bits.fill_null(0).cast(pl.UInt32)
+
+
+def feature_text(df: pl.DataFrame) -> pl.DataFrame:
+    """Features v3 rewrites of name_red / addr_norm (see the module doc); df has country, name_red, addr_norm."""
+    fr = pl.col("country") == "France"
+    red_fr = _ws(pl.col("name_red").str.replace_all(r"\b(?:ei|e i|s a)\b", " "))
+    addr = pl.col("addr_norm").fill_null("").str.replace_all(r"\bno (\d)", "${1}")
+    addr = pl.when(fr).then(_ws(word_map(addr, FR_PLACES).str.replace_all(r"\bn (\d)", "${1}"))).otherwise(addr)
+    return df.with_columns(name_red=pl.when(fr & (red_fr != "")).then(red_fr).otherwise(pl.col("name_red")),
+                           addr_norm=addr).with_columns(addr_missing=pl.col("addr_norm") == "")
 
 
 def first_number(raw_address: pl.Expr) -> pl.Expr:
@@ -41,9 +68,12 @@ def first_number(raw_address: pl.Expr) -> pl.Expr:
 
 def enrich_frame(norm: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
     """norm: normalized records of one split; raw: the same split's raw records."""
-    df = norm.join(raw.select("entity_id", "business_address"), on="entity_id", how="left")
-    df = df.with_columns(legal_bits=legal_bits(pl.col("name_cons")), hn=first_number(pl.col("business_address")),
-                         name_ntok=pl.col("name_red").str.split(" ").list.len().cast(pl.Float32)).drop("business_address")
+    df = feature_text(norm.join(raw.select("entity_id", "business_name", "business_address"), on="entity_id", how="left"))
+    df = df.with_columns(legal_bits=legal_bits(pl.col("name_cons"), pl.col("country") == "France"),
+                         hn=first_number(pl.col("business_address")),
+                         name_ntok=pl.col("name_red").str.split(" ").list.len().cast(pl.Float32),
+                         raw_name=pl.col("business_name").fill_null("").str.strip_chars(),
+                         raw_addr=pl.col("business_address").fill_null("").str.strip_chars()).drop("business_name", "business_address")
     vocab = (df.filter(pl.col("source") == "S1").select(tok=pl.col("name_red").str.split(" "))
              .explode("tok", empty_as_null=True).drop_nulls().unique().with_columns(known=pl.lit(1.0)))
     unknown = (df.select("entity_id", tok=pl.col("name_red").str.split(" ")).explode("tok", empty_as_null=True).drop_nulls()

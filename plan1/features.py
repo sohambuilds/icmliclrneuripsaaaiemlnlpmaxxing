@@ -21,7 +21,7 @@ import polars as pl
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 
-from .enrich import TAG_BIT
+from .enrich import TAG_MASK
 
 BASE_FEATURES = [
     "name_red_ratio",      # reduced-name string ratio
@@ -55,7 +55,8 @@ TRAP_FEATURES = (
     + ["n_extra_t", "n_extra_q", "n_shared_words", "extra_short_word", "extra_alias_marker"]
     + ["q_name_ntok", "t_name_ntok", "t_name_unknown_share", "q_name_s1_rate", "t_name_rate", "t_addr_rate"]
 )
-FEATURES = BASE_FEATURES + EXTRA_FEATURES + TRAP_FEATURES
+RAW_FEATURES = ["raw_name_exact", "raw_addr_exact", "raw_name_ratio", "raw_addr_ratio"]  # features v3: raw text, case kept
+FEATURES = BASE_FEATURES + EXTRA_FEATURES + TRAP_FEATURES + RAW_FEATURES
 FEATURE_GROUPS = {  # for ablations (plan1/ablate.py)
     "extra_similarity": ["name_red_token_sort", "name_red_partial", "name_red_jw", "name_nospace_ratio", "addr_ratio",
                          "cand_name_nonlatin", "num_shared"],
@@ -66,9 +67,11 @@ FEATURE_GROUPS = {  # for ablations (plan1/ablate.py)
     "house_number": ["hn_both", "hn_equal", "hn_absdiff_log", "hn_len_diff", "hn_lev", "hn_prefix_suffix"],
     "extra_words": ["n_extra_t", "n_extra_q", "n_shared_words", "extra_short_word", "extra_alias_marker"],
     "alias_frequency": ["q_name_ntok", "t_name_ntok", "t_name_unknown_share", "q_name_s1_rate", "t_name_rate", "t_addr_rate"],
+    "raw_text": RAW_FEATURES,
 }
 _TEXT_COLS = ["name_red", "name_cons", "addr_norm", "addr_nums", "addr_missing", "name_nonlatin",
-              "legal_bits", "hn", "name_ntok", "name_unknown_share", "q_name_s1_rate", "t_name_rate", "t_addr_rate"]
+              "legal_bits", "hn", "name_ntok", "name_unknown_share", "q_name_s1_rate", "t_name_rate", "t_addr_rate",
+              "raw_name", "raw_addr"]
 F32 = pl.Float32
 
 
@@ -106,8 +109,8 @@ def _trap_features(b: pl.DataFrame, qn: pl.Series, tn: pl.Series) -> dict:
         "legal_partial": (q0 & t0 & (inter != 0) & (inter != qb) & (inter != tb)).astype(f32),
     }
     for tag in LEGAL_FLAG_TAGS:
-        out[f"q_legal_{tag}"] = ((qb & TAG_BIT[tag]) != 0).astype(f32)
-        out[f"t_legal_{tag}"] = ((tb & TAG_BIT[tag]) != 0).astype(f32)
+        out[f"q_legal_{tag}"] = ((qb & TAG_MASK[tag]) != 0).astype(f32)
+        out[f"t_legal_{tag}"] = ((tb & TAG_MASK[tag]) != 0).astype(f32)
 
     hq, ht = b["q_hn"].fill_null(""), b["t_hn"].fill_null("")
     both = ((hq != "") & (ht != "")).to_numpy()
@@ -228,6 +231,10 @@ def build_features(cands: pl.DataFrame, q: pl.DataFrame, t: pl.DataFrame, batch:
             "fallback_name_score": b["fb_score"].cast(F32),
             "from_fallback": b["fb_score"].is_not_null().cast(F32),
             **_trap_features(b, qn, tn),
+            "raw_name_exact": (b["q_raw_name"] == b["t_raw_name"]).cast(F32),
+            "raw_addr_exact": ((b["q_raw_addr"] == b["t_raw_addr"]) & (b["q_raw_addr"] != "")).cast(F32),
+            "raw_name_ratio": _sim(b["q_raw_name"], b["t_raw_name"], fuzz.ratio),
+            "raw_addr_ratio": _sim(b["q_raw_addr"], b["t_raw_addr"], fuzz.ratio),
         }))
     out = pl.concat(parts)
     floats = [c for c in out.columns if c not in ("s1_id", "target_id", "source")]

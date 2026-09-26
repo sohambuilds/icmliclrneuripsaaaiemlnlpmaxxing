@@ -105,6 +105,18 @@ STAGE2_FOLDS = 3  # out-of-fold first-stage scores for the Fit sample
 STAGE2_FOLD_SALT = "amc26-stage2-fold-v1"
 STAGE2_ANCHOR_P = 0.5  # candidates scoring at least this are the "likely records" others are compared with
 
+# ---- second stage v2 with the cross-encoder (plan1/stage2ce.py, plan1/cross_encoder.py) ----
+S2_MIN_P1 = 1e-3  # stage 2 and the cross-encoder only look at candidates the first stage scores at least this
+S2_TOP = 30       # ... and at most this many per S1 (highest first-stage scores)
+CE_MODEL = os.environ.get("AMC_CE_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")  # Apache 2.0
+CE_MAX_LEN = 96       # tokens for the pair (S1 text + record text)
+CE_BATCH = 256        # training batch (pairs)
+CE_INFER_BATCH = 2048
+CE_LR = 8e-5
+CE_WARMUP = 0.03      # share of steps with a rising learning rate
+CE_EPOCHS = 1
+CE_HOLDOUT = 0.02     # share of ce_train S1 kept aside to check the trained model
+
 # ---- leaderboard variants (plan1/variants.py) ----
 VARIANT_MARGIN = 0.05  # drop a contested record when the runner-up is this close to the winner
 VARIANT_CAP = 10       # keep at most this many matches per S1 (training max is 11)

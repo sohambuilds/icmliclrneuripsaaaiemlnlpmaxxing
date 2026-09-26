@@ -9,6 +9,8 @@ Each variant goes to output/plan1/<run>[-s2]-<variant>/matching_results.tsv:
   france  the main answer for France S1 only, every other S1 empty: a leaderboard probe. Because the score is a
           mean over S1, (probe score - share of non-France S1 that truly have no match) / France share of S1
           estimates France's own score; the no-match share is unknown, ~5.6% in train.
+  nofrance  the main answer with every France S1 empty: the better probe. (main - nofrance) / France share of S1
+          = France's mean score - France's no-match share, so only the small France no-match share is guessed.
 Validate each with utils/validate_submission.py --matching <file> --test-dir dataset/test --check-ids
 """
 import json
@@ -49,6 +51,7 @@ def main(stage: str) -> None:
                    .filter(pl.int_range(pl.len()).over("s1_id") < C.VARIANT_CAP),
         f"crowd{C.CROWD_LIMIT}": one_owner(drop_crowded(accepted, C.CROWD_LIMIT)),
         "france": base.join(s1c.filter(pl.col("country") == "France"), on="s1_id", how="semi"),
+        "nofrance": base.join(s1c.filter(pl.col("country") == "France"), on="s1_id", how="anti"),
     }
     print(f"{stage}: threshold {thr}, main answer (one owner) {base.height:,} links")
     for name, links in variants.items():
@@ -59,7 +62,8 @@ def main(stage: str) -> None:
         print(f"\n{name}: {links.height:,} links ({base.height - links.height:,} fewer than main) -> {path}")
         print(per)
     fr_share = s1c.filter(pl.col("country") == "France").height / s1c.height
-    print(f"\nFrance is {fr_share:.1%} of test S1. France probe: France score ~ (probe - {1 - fr_share:.3f} x no-match share) / {fr_share:.3f}")
+    print(f"\nFrance is {fr_share:.1%} of test S1. Best France probe = upload main + nofrance:")
+    print(f"  France score ~ (main - nofrance) / {fr_share:.4f} + France no-match share (~0.056 in train)")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ models) from Fit-role training data only; same pipeline for train and test; subm
 | p1-v3 | + no-address name fallback search, 8000-round cap (stopped 4266), better dictionary, fresh panel | 0.9537 | 0.9531 | 0.9404 |
 | p1-v3-crowd10 | + drop records claimed by 10+ S1 | – | – | 0.940413 (no change) |
 | p1-v3-s2 | trap features (legal / house number / extra words / alias / frequency) + stage 2, XGBoost GPU | 0.9793 | 0.9794 | ? |
+| p1-v3-s2ce | features v3 (French legal forms apart) + cross-encoder feature + 2× stage-2 data | ? | ? | ? |
 
 Leaderboard ≈ panel − 1.3 to 1.4 (test has ~40% unmatched S2/S3 records vs 26% in train, plus France).
 
@@ -103,6 +104,50 @@ Rule from here: every model trains and predicts on the GPU.
 ### Expected-F0.5 per-business decision (decide_ef.py): no gain
 Calibrated (isotonic on C-select) + tuned alpha/gamma: dev 0.9791 vs 0.9793 global threshold, fresh 0.9800 vs
 0.9794 — noise, and no-match S1 given a link doubles (1.2% → 2–3.6%). Keep the global threshold.
+
+### France (15% of test S1, no training data): likely the biggest leaderboard lever
+- Test p1-v3-s2 per country: France accepts 3.61 links/S1 and keeps 3.39 after one owner (6% of its links contested),
+  while US/India accept 3.37 and keep 3.36–3.38. France's empty-answer rate is 5.0%, against 5.9% for US/India.
+  So France over-links.
+- If US/India score like the panel (0.979), France at 0.90 would make the leaderboard 0.967. Reaching 0.98 needs France ≈ 0.98.
+- French names repeat a lot ("Tourcoing Sante" is the name of 14+ S1 in one city). There are about 15 cities, 4
+  departments and 3 regions. S1 always writes the region; S2/S3 write it about 1/3 of the time and often write the
+  department instead (Nord, Gironde, Loire-Atlantique, Pas-de-Calais).
+- **Bug**: features v2 gave every French legal form (SARL/SAS/SASU/EURL/SA/SCI/SNC) ONE tag "FR", so planted swaps like
+  SAS→EURL and EI→SCI looked "same". Copies seen in the test data: "XG Culturelle SAS 35 Av des Ajoncs" →
+  "E.U.R.L. XG Culturelle 37 Av…"; "Jeux & Cie EI 108 Bd G. Pompidou" → "Jeux & Cie SCI 129 Bd…".
+- **Features v3** (enrich.py):
+  - Each French form gets its own tag, on French records only.
+  - French-only dotted forms S.A./E.I. are handled.
+  - Feature addresses drop French regions/departments and number markers (no 12 → 12; French n° → n 12 → 12).
+- **Probe**: upload main + `nofrance` (France S1 empty). Then France score ≈ (main − nofrance)/0.1498 + ~0.056.
+- Diagnostic: `plan1/france_check.py` measures legal-form change tables on near-identical pairs and accepted France
+  links that have a form change.
+
+### Leaderboard shape (2026-09-26)
+- Clusters: 0.957–0.958 and 0.965 ± 0.001. Then an even spread from 0.970 to 0.978, a jump to 0.98, and the top 3 all at 0.988.
+- Reading: tight clusters mean shared methods hitting the same traps, so gains come in steps (one trap type cracked
+  at a time).
+- The top 3 at 0.988 is probably the ceiling. Part of the data is ambiguous by design: address-less records whose
+  name several businesses share (train has ~10 different businesses named "Obsidian, LLC").
+- Realistic target: 0.985+.
+
+### Raw-text features (features v3)
+- raw_name_exact, raw_addr_exact, raw_name_ratio, raw_addr_ratio: exact text, case kept.
+- Train examples: copies get re-formatted ("85 Wayne Avenue, …, NY" → "96 Wayne Avenue, …, New York"), while some
+  true records keep the S1's exact address (the "Korbrixx D.B.A. Obsidian, LLC" alias).
+- True records in one source share that source's typos (two S2 records both have "DEER PARK CIYT").
+- True-record suffix words ("Center", "Service") differ from copy words ("Downtown", "Metro"…). The cross-encoder
+  sees which word it is.
+
+### Run p1-v3-s2ce (plan1/stage2ce.py + plan1/cross_encoder.py)
+- Features v3, then stage 1 on the same 300k Fit sample, with out-of-fold scores.
+- Stage 2 only looks at p1 ≥ 1e-3 (top 30 per S1). It trains on Fit (out-of-fold p1) plus gbm_extra, which is 300k new
+  Fit-role S1 scored by the full stage-1 model, exactly as on test.
+- New feature: a GPU cross-encoder (multilingual MiniLM-L12, Apache 2.0). It is fine-tuned on the ce_train pairs
+  (300k other Fit-role S1) and adds its logit plus rank/max/gap/second/count context. A no-cross-encoder model is
+  trained on the same rows for comparison.
+- The test pass writes both outputs: `-s2ce` and `-s2ce-noce`.
 
 ### Locked plan (2026-09-26)
 1. retrieve_extra.py: candidates for 600k more Fit-role S1 (CPU, background): 300k "ce_train", 300k "gbm_extra".
