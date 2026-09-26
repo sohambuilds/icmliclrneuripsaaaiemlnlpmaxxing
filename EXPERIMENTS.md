@@ -100,6 +100,15 @@ Rule from here: every model trains and predicts on the GPU.
   "Novan Limited" vs "Novana Limited", "FK Des" vs "FM Des" (one-letter name changes = copies too).
 - Simple "looks like an accepted record" rescue still hurts (adds ≥ as many wrong as right).
 
+### Expected-F0.5 per-business decision (decide_ef.py): no gain
+Calibrated (isotonic on C-select) + tuned alpha/gamma: dev 0.9791 vs 0.9793 global threshold, fresh 0.9800 vs
+0.9794 — noise, and no-match S1 given a link doubles (1.2% → 2–3.6%). Keep the global threshold.
+
+### Locked plan (2026-09-26)
+1. retrieve_extra.py: candidates for 600k more Fit-role S1 (CPU, background): 300k "ce_train", 300k "gbm_extra".
+2. GPU text cross-encoder (multilingual MiniLM, Apache 2.0) trained on ce_train pairs; score = stage-2 feature.
+3. Retrain stage 2 (XGBoost GPU) with cross-encoder score + gbm_extra data → panels → test → leaderboard.
+
 ## Next (ranked; goal 0.98+ on the leaderboard, 0.99 by day 3)
 1. **Per-business decision instead of one global threshold**: calibrate stage-2 scores (isotonic on C-select), then
    for each S1 pick the set of candidates that maximises *expected* F0.5 (incl. the "nothing" option). No retraining;
